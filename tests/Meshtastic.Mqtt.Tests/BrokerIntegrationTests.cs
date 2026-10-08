@@ -37,7 +37,7 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
                 password_hash: "{AuthTests.MeshdevHash}"
               - username: alice
                 password_hash: "{AuthTests.AliceHash}"
-                subscribe_allow: [msh/ES/2/e/test/#]
+                subscribe_allow: [msh/ES/2/e/test/#, msh/ES/2/e/Test/#]
             """);
         var options = new MqttServerOptionsBuilder().WithDefaultEndpoint().WithDefaultEndpointPort(_port).Build();
         options.DefaultEndpointOptions.BoundInterNetworkAddress = IPAddress.Loopback;
@@ -129,7 +129,7 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ValidPacketsReachSubscribers_GarbageAndWrongKeyDoNot()
+    public async Task ValidPacketReachesSubscriber_GarbageAndChannelIdMismatchDoNot()
     {
         var received = new ConcurrentQueue<string>();
         var (sub, _) = await Connect("alice", AlicePassword, "dash-1");
@@ -158,7 +158,65 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
 
         var only = Assert.Single(received);
         Assert.StartsWith("msh/ES/2/e/test/!1a2b3c4d 75 retain=False", only);
+        Assert.Contains(_logs.Events, e => e.RenderMessage().Contains("channel_id does not match the topic"));
         Assert.DoesNotContain(_logs.Events, e => e.RenderMessage().Contains("fixture-payload"));
+    }
+
+    async Task<ConcurrentQueue<string>> SubscribeAlice(string filter)
+    {
+        var received = new ConcurrentQueue<string>();
+        var (sub, _) = await Connect("alice", AlicePassword, "dash-2");
+        sub.ApplicationMessageReceivedAsync += e =>
+        {
+            received.Enqueue(e.ApplicationMessage.Topic + " " + e.ApplicationMessage.Payload.Length);
+            return Task.CompletedTask;
+        };
+        Assert.Equal(MqttClientSubscribeResultCode.GrantedQoS0, await Subscribe(sub, filter));
+        return received;
+    }
+
+    async Task PublishAsMeshdev(string topic, string fixture, bool retain = false)
+    {
+        var (pub, _) = await Connect("meshdev", "large4cats", "node-2");
+        await pub.PublishAsync(new MqttApplicationMessageBuilder().WithTopic(topic)
+                .WithPayload(PublishFilterTests.Fixture(fixture)).WithRetainFlag(retain)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce).Build(),
+            TestContext.Current.CancellationToken);
+    }
+
+    static async Task Settle(ConcurrentQueue<string> received)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (received.IsEmpty && DateTime.UtcNow < deadline)
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+        await Task.Delay(300, TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task WrongKey_WithMatchingChannelAndTopic_IsDroppedAsUndecryptable()
+    {
+        // channel_id `Test` on topic .../Test/..., but encrypted with AQ== while the broker has Test: Ag==.
+        var received = await SubscribeAlice("msh/ES/2/e/Test/#");
+        await PublishAsMeshdev("msh/ES/2/e/Test/!1a2b3c4d", "test_wrong_key_aq.bin");
+        await PublishAsMeshdev("msh/ES/2/e/Test/!1a2b3c4d", "test_ag.bin");   // the right key still passes
+        await Settle(received);
+
+        var only = Assert.Single(received);
+        Assert.Equal("msh/ES/2/e/Test/!1a2b3c4d 66", only);
+        Assert.Contains(_logs.Events, e => e.RenderMessage().Contains("undecryptable with the key configured for this channel"));
+    }
+
+    [Fact]
+    public async Task AcceptedRetainedPublish_IsNotStored()
+    {
+        // Live delivery never shows retain (MQTTnet clears it without RetainAsPublished); the retained store is
+        // what the retain-clearing line protects.
+        var received = await SubscribeAlice("msh/ES/2/e/Test/#");
+        await PublishAsMeshdev("msh/ES/2/e/Test/!1a2b3c4d", "test_ag.bin", retain: true);
+        await Settle(received);
+
+        Assert.Single(received);
+        Assert.Empty(await _server.GetRetainedMessagesAsync());
     }
 
     [Fact]

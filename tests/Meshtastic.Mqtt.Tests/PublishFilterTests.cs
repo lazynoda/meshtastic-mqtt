@@ -175,6 +175,35 @@ public class PublishFilterTests
         Assert.False(r.Accepted);
     }
 
+    public static TheoryData<string, Action<ServiceEnvelope>> PkiShapeViolations => new()
+    {
+        { "to 0", e => e.Packet.To = 0 },
+        { "to broadcast", e => e.Packet.To = uint.MaxValue },
+        { "channel hash not 0", e => e.Packet.Channel = 8 },
+        { "12 bytes (CCM tag + extra nonce, no ciphertext)", e => e.Packet.Encrypted = ByteString.CopyFrom(new byte[12]) },
+        { "1 byte", e => e.Packet.Encrypted = ByteString.CopyFrom(new byte[1]) },
+    };
+
+    [Theory]
+    [MemberData(nameof(PkiShapeViolations))]
+    public void PkiShapeViolations_AreDropped_EvenWithDropPkiOff(string name, Action<ServiceEnvelope> mutate)
+    {
+        // With drop_pki: false these checks are all that stops arbitrary blobs labelled "PKI" from passing.
+        var env = ServiceEnvelope.Parser.ParseFrom(Fixture("pki_dm.bin"));
+        mutate(env);
+        var r = Inspect("msh/ES/2/e/PKI/!1a2b3c4d", env.ToByteArray(), Config(dropPki: false));
+        Assert.False(r.Accepted, name);
+        Assert.Equal("malformed PKI packet", r.Reason);
+    }
+
+    [Fact]
+    public void PkiShape_ThirteenBytes_IsTheSmallestAccepted()
+    {
+        var env = ServiceEnvelope.Parser.ParseFrom(Fixture("pki_dm.bin"));
+        env.Packet.Encrypted = ByteString.CopyFrom(new byte[13]);
+        Assert.True(Inspect("msh/ES/2/e/PKI/!1a2b3c4d", env.ToByteArray(), Config(dropPki: false)).Accepted);
+    }
+
     public static TheoryData<string, Action<ServiceEnvelope>> Mutations => new()
     {
         { "no packet", e => e.Packet = null },
