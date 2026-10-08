@@ -81,7 +81,7 @@ Start from [`config.example.yaml`](config.example.yaml).
 |---|---|---|
 | `listener.bind_address` | `0.0.0.0` | IPv4 or IPv6 literal to listen on (`::` = IPv6 only). |
 | `listener.port` | `1883` | TCP port (plain MQTT). |
-| `log_level` | `information` | `verbose`, `debug`, `information`, `warning`, `error`, `fatal`. `debug` also logs every accepted packet. |
+| `log_level` | `information` | `verbose`, `debug`, `information`, `warning`, `error`, `fatal`. See [Logs](#logs). |
 | `drop_undecryptable` | `true` | Drop channel packets that do not decrypt with their channel's key. Must be `true` or `false` if present. |
 | `drop_pki` | `true` | Drop PKI-encrypted DMs (see above). Must be `true` or `false` if present. |
 | `default_psk` | `AQ==` | Base64 PSK for any channel not listed under `channels`. |
@@ -109,6 +109,21 @@ and `auth_queue_timeout_seconds`, so a flood of bad logins can neither grow memo
 legitimate users waiting. Simultaneous logins with the same username and password (a fleet of `meshdev`
 nodes reconnecting after a broker restart) share one PBKDF2 computation, and the check with the most logins
 waiting on it runs first, so the real `meshdev` password jumps ahead of an attacker's one-off guesses.
+
+### Logs
+
+Logs never contain passwords or message payloads. At the default `information` level:
+
+- Connections, granted subscriptions and the startup line: Information.
+- Failed logins: Warning, one line per attempt with username and remote IP (the format fail2ban will
+  read): `Authentication failed for user {Username} from {RemoteIp} (client {ClientId})`. Refused
+  authentication methods, client-id conflicts and "server busy" refusals are also Warning with username and IP.
+- A refused SUBSCRIBE: one Warning per packet (count of refused filters and the first one), however many
+  filters it carries.
+- Dropped publishes: one Information line every 60 s with the number of drops per reason, only when
+  something was dropped. Each dropped packet is logged individually only at `debug`.
+
+`debug` also logs every accepted packet (topic, client, `from`, packet id, portnum).
 
 ### Channel keys
 

@@ -1,15 +1,18 @@
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Net;
-using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using Meshtastic.Mqtt;
 using MQTTnet;
+using MQTTnet.Adapter;
 using MQTTnet.Formatter;
+using MQTTnet.Packets;
 using MQTTnet.Protocol;
 using MQTTnet.Server;
 using Serilog;
-using Serilog.Core;
 using Serilog.Events;
 using Xunit;
+using static Meshtastic.Mqtt.Tests.TestSupport;
 
 namespace Meshtastic.Mqtt.Tests;
 
@@ -18,14 +21,15 @@ namespace Meshtastic.Mqtt.Tests;
 /// </summary>
 public sealed class BrokerIntegrationTests : IAsyncLifetime
 {
-    const string AlicePassword = "correct-horse";
     readonly int _port = FreePort();
     readonly LogSink _logs = new();
+    BrokerConfig _config = null!;
     MqttServer _server = null!;
+    Action _flushDrops = null!;
 
     public async ValueTask InitializeAsync()
     {
-        var config = ConfigLoader.Parse($"""
+        _config = ConfigLoader.Parse($"""
             listener:
               bind_address: 127.0.0.1
               port: {_port}
@@ -39,12 +43,8 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
                 password_hash: "{AuthTests.AliceHash}"
                 subscribe_allow: [msh/ES/2/e/test/#, msh/ES/2/e/Test/#]
             """);
-        var options = new MqttServerOptionsBuilder().WithDefaultEndpoint().WithDefaultEndpointPort(_port).Build();
-        options.DefaultEndpointOptions.BoundInterNetworkAddress = IPAddress.Loopback;
-        options.DefaultEndpointOptions.BoundInterNetworkV6Address = IPAddress.None;
-        _server = new MqttServerFactory().CreateMqttServer(options);
         var logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(_logs).CreateLogger();
-        new BrokerHooks(config, logger).Attach(_server);
+        (_server, _flushDrops) = TestBroker.CreateWithHooks(_config, logger);
         await _server.StartAsync();
     }
 
@@ -54,34 +54,48 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
         _server.Dispose();
     }
 
-    static int FreePort()
-    {
-        var l = new TcpListener(IPAddress.Loopback, 0);
-        l.Start();
-        var port = ((IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
-    }
+    static CancellationToken Ct => TestContext.Current.CancellationToken;
 
     async Task<(IMqttClient Client, MqttClientConnectResult Result)> Connect(string user, string password, string clientId,
         MqttProtocolVersion version = MqttProtocolVersion.V311)
     {
         var client = new MqttClientFactory().CreateMqttClient();
-        var options = new MqttClientOptionsBuilder()
-            .WithTcpServer("127.0.0.1", _port)
-            .WithClientId(clientId)
-            .WithCredentials(user, password)
-            .WithProtocolVersion(version)
-            .WithTimeout(TimeSpan.FromSeconds(10))
-            .Build();
-        return (client, await client.ConnectAsync(options, TestContext.Current.CancellationToken));
+        return (client, await client.ConnectAsync(ClientOptions(_port, user, password, clientId, version), Ct));
     }
 
-    async Task<MqttClientSubscribeResultCode> Subscribe(IMqttClient client, string filter)
+    static async Task<MqttClientSubscribeResultCode> Subscribe(IMqttClient client, string filter)
     {
-        var result = await client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder().WithTopicFilter(filter).Build(),
-            TestContext.Current.CancellationToken);
+        var result = await client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder().WithTopicFilter(filter).Build(), Ct);
         return Assert.Single(result.Items).ResultCode;
+    }
+
+    async Task<(IMqttClient Sub, ConcurrentQueue<string> Received)> Subscriber(params string[] filters)
+    {
+        var received = new ConcurrentQueue<string>();
+        var (sub, _) = await Connect("alice", AlicePassword, "dash-1");
+        sub.ApplicationMessageReceivedAsync += e =>
+        {
+            received.Enqueue(e.ApplicationMessage.Topic + " " + e.ApplicationMessage.Payload.Length + " retain=" + e.ApplicationMessage.Retain);
+            return Task.CompletedTask;
+        };
+        foreach (var filter in filters)
+            Assert.Equal(MqttClientSubscribeResultCode.GrantedQoS0, await Subscribe(sub, filter));
+        return (sub, received);
+    }
+
+    async Task<Func<string, string, bool, Task>> Publisher()
+    {
+        var (pub, _) = await Connect("meshdev", "large4cats", "node-1");
+        return async (topic, fixture, retain) =>
+            await pub.PublishAsync(new MqttApplicationMessageBuilder().WithTopic(topic)
+                    .WithPayload(PublishFilterTests.Fixture(fixture)).WithRetainFlag(retain)
+                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce).Build(), Ct);
+    }
+
+    static async Task Settle(ConcurrentQueue<string> received)
+    {
+        await WaitUntil(() => !received.IsEmpty);
+        await Task.Delay(300, Ct);
     }
 
     [Fact]
@@ -93,9 +107,13 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
         var (_, unknown) = await Connect("mallory", "large4cats", "node-2");
         Assert.Equal(MqttClientConnectResultCode.BadUserNameOrPassword, unknown.ResultCode);
 
+        // fail2ban (phase 4) reads these: Warning, one line per attempt, with username and IP.
         var failure = Assert.Single(_logs.Events, e => e.MessageTemplate.Text.StartsWith("Authentication failed")
                                                        && e.Properties["Username"].ToString().Contains("meshdev"));
+        Assert.Equal(LogEventLevel.Warning, failure.Level);
         Assert.Contains("127.0.0.1", failure.Properties["RemoteIp"].ToString());
+        Assert.Single(_logs.Events, e => e.MessageTemplate.Text.StartsWith("Authentication failed")
+                                         && e.Properties["Username"].ToString().Contains("mallory"));
         Assert.DoesNotContain(_logs.Events, e => e.RenderMessage().Contains("not-the-password-xyz"));
     }
 
@@ -131,30 +149,13 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task ValidPacketReachesSubscriber_GarbageAndChannelIdMismatchDoNot()
     {
-        var received = new ConcurrentQueue<string>();
-        var (sub, _) = await Connect("alice", AlicePassword, "dash-1");
-        sub.ApplicationMessageReceivedAsync += e =>
-        {
-            received.Enqueue(e.ApplicationMessage.Topic + " " + e.ApplicationMessage.Payload.Length + " retain=" + e.ApplicationMessage.Retain);
-            return Task.CompletedTask;
-        };
-        Assert.Equal(MqttClientSubscribeResultCode.GrantedQoS0, await Subscribe(sub, "msh/ES/2/e/test/#"));
+        var (_, received) = await Subscriber("msh/ES/2/e/test/#");
+        var publish = await Publisher();
 
-        var (pub, _) = await Connect("meshdev", "large4cats", "node-1");
-        async Task Publish(string topic, string fixture, bool retain = false) =>
-            await pub.PublishAsync(new MqttApplicationMessageBuilder().WithTopic(topic)
-                    .WithPayload(PublishFilterTests.Fixture(fixture)).WithRetainFlag(retain)
-                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce).Build(),
-                TestContext.Current.CancellationToken);
-
-        await Publish("msh/ES/2/e/test/!1a2b3c4d", "garbage.bin");
-        await Publish("msh/ES/2/e/test/!1a2b3c4d", "test_wrong_key_aq.bin");   // channel_id Test != topic test
-        await Publish("msh/ES/2/e/test/!1a2b3c4d", "test_lower_aq.bin", retain: true);
-
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (received.IsEmpty && DateTime.UtcNow < deadline)
-            await Task.Delay(50, TestContext.Current.CancellationToken);
-        await Task.Delay(300, TestContext.Current.CancellationToken);
+        await publish("msh/ES/2/e/test/!1a2b3c4d", "garbage.bin", false);
+        await publish("msh/ES/2/e/test/!1a2b3c4d", "test_wrong_key_aq.bin", false);   // channel_id Test != topic test
+        await publish("msh/ES/2/e/test/!1a2b3c4d", "test_lower_aq.bin", true);
+        await Settle(received);
 
         var only = Assert.Single(received);
         Assert.StartsWith("msh/ES/2/e/test/!1a2b3c4d 75 retain=False", only);
@@ -162,47 +163,19 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
         Assert.DoesNotContain(_logs.Events, e => e.RenderMessage().Contains("fixture-payload"));
     }
 
-    async Task<ConcurrentQueue<string>> SubscribeAlice(string filter)
-    {
-        var received = new ConcurrentQueue<string>();
-        var (sub, _) = await Connect("alice", AlicePassword, "dash-2");
-        sub.ApplicationMessageReceivedAsync += e =>
-        {
-            received.Enqueue(e.ApplicationMessage.Topic + " " + e.ApplicationMessage.Payload.Length);
-            return Task.CompletedTask;
-        };
-        Assert.Equal(MqttClientSubscribeResultCode.GrantedQoS0, await Subscribe(sub, filter));
-        return received;
-    }
-
-    async Task PublishAsMeshdev(string topic, string fixture, bool retain = false)
-    {
-        var (pub, _) = await Connect("meshdev", "large4cats", "node-2");
-        await pub.PublishAsync(new MqttApplicationMessageBuilder().WithTopic(topic)
-                .WithPayload(PublishFilterTests.Fixture(fixture)).WithRetainFlag(retain)
-                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce).Build(),
-            TestContext.Current.CancellationToken);
-    }
-
-    static async Task Settle(ConcurrentQueue<string> received)
-    {
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (received.IsEmpty && DateTime.UtcNow < deadline)
-            await Task.Delay(50, TestContext.Current.CancellationToken);
-        await Task.Delay(300, TestContext.Current.CancellationToken);
-    }
-
     [Fact]
     public async Task WrongKey_WithMatchingChannelAndTopic_IsDroppedAsUndecryptable()
     {
         // channel_id `Test` on topic .../Test/..., but encrypted with AQ== while the broker has Test: Ag==.
-        var received = await SubscribeAlice("msh/ES/2/e/Test/#");
-        await PublishAsMeshdev("msh/ES/2/e/Test/!1a2b3c4d", "test_wrong_key_aq.bin");
-        await PublishAsMeshdev("msh/ES/2/e/Test/!1a2b3c4d", "test_ag.bin");   // the right key still passes
+        var (_, received) = await Subscriber("msh/ES/2/e/Test/#");
+        var publish = await Publisher();
+
+        await publish("msh/ES/2/e/Test/!1a2b3c4d", "test_wrong_key_aq.bin", false);
+        await publish("msh/ES/2/e/Test/!1a2b3c4d", "test_ag.bin", false);   // the right key still passes
         await Settle(received);
 
         var only = Assert.Single(received);
-        Assert.Equal("msh/ES/2/e/Test/!1a2b3c4d 66", only);
+        Assert.StartsWith("msh/ES/2/e/Test/!1a2b3c4d 66 ", only);
         Assert.Contains(_logs.Events, e => e.RenderMessage().Contains("undecryptable with the key configured for this channel"));
     }
 
@@ -211,13 +184,88 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
     {
         // Live delivery never shows retain (MQTTnet clears it without RetainAsPublished); the retained store is
         // what the retain-clearing line protects.
-        var received = await SubscribeAlice("msh/ES/2/e/Test/#");
-        await PublishAsMeshdev("msh/ES/2/e/Test/!1a2b3c4d", "test_ag.bin", retain: true);
+        var (_, received) = await Subscriber("msh/ES/2/e/Test/#");
+        var publish = await Publisher();
+        await publish("msh/ES/2/e/Test/!1a2b3c4d", "test_ag.bin", true);
         await Settle(received);
 
         Assert.Single(received);
         Assert.Empty(await _server.GetRetainedMessagesAsync());
     }
+
+    [Fact]
+    public async Task DroppedPublishes_AreDebugPerPacket_AndSummarisedPerReason()
+    {
+        var publish = await Publisher();
+        await publish("msh/ES/2/e/test/!1a2b3c4d", "garbage.bin", false);
+        await publish("msh/ES/2/e/test/!1a2b3c4d", "garbage.bin", false);
+        await publish("msh/ES/2/e/Test/!1a2b3c4d", "test_wrong_key_aq.bin", false);
+        await WaitUntil(() => _logs.Events.Count(e => e.MessageTemplate.Text.StartsWith("Dropped publish")) >= 3);
+
+        var perPacket = _logs.Events.Where(e => e.MessageTemplate.Text.StartsWith("Dropped publish")).ToList();
+        Assert.Equal(3, perPacket.Count);
+        Assert.All(perPacket, e => Assert.Equal(LogEventLevel.Debug, e.Level));
+
+        _flushDrops();
+        var summary = Assert.Single(_logs.Events, e => e.Level == LogEventLevel.Information && e.MessageTemplate.Text.StartsWith("Dropped {Total}"));
+        Assert.Equal("3", summary.Properties["Total"].ToString());
+        var rendered = summary.RenderMessage();
+        Assert.Contains("malformed protobuf", rendered);
+        Assert.Contains("undecryptable", rendered);
+
+        // Nothing dropped since: the next summary is silent.
+        _flushDrops();
+        Assert.Single(_logs.Events, e => e.MessageTemplate.Text.StartsWith("Dropped {Total}"));
+    }
+
+    [Fact]
+    public async Task RefusedSubscribe_IsOneWarningPerPacket()
+    {
+        var (client, _) = await Connect("meshdev", "large4cats", "node-1", MqttProtocolVersion.V500);
+        var builder = new MqttClientSubscribeOptionsBuilder();
+        for (var i = 0; i < 50; i++)
+            builder = builder.WithTopicFilter($"msh/ES/2/e/ch{i}/#");
+        var result = await client.SubscribeAsync(builder.Build(), Ct);
+        Assert.Equal(50, result.Items.Count);
+        Assert.All(result.Items, r => Assert.Equal(MqttClientSubscribeResultCode.NotAuthorized, r.ResultCode));
+
+        var warnings = _logs.Events.Where(e => e.Level >= LogEventLevel.Warning && e.RenderMessage().Contains("refused")).ToList();
+        var warning = Assert.Single(warnings);
+        Assert.Equal("50", warning.Properties["Refused"].ToString());
+        Assert.Contains("meshdev", warning.Properties["Username"].ToString());
+    }
+
+    [Fact]
+    public async Task AuthenticationMethodRefusal_LogsUsernameAndIp()
+    {
+        var hooks = new BrokerHooks(_config, LoggerFor(_logs));
+        var args = Args(new MqttConnectPacket { ClientId = "x", Username = "meshdev", AuthenticationMethod = "SCRAM-SHA-1" }, new FakeAdapter());
+        await hooks.ValidateConnectionAsync(args);
+
+        Assert.Equal(MqttConnectReasonCode.BadAuthenticationMethod, args.ReasonCode);
+        var line = Assert.Single(_logs.Events, e => e.RenderMessage().Contains("SCRAM-SHA-1"));
+        Assert.Contains("meshdev", line.Properties["Username"].ToString());
+        Assert.Contains("203.0.113.7", line.Properties["RemoteIp"].ToString());
+    }
+
+    [Fact]
+    public async Task ConnectCheckException_LogsUsernameAndIp()
+    {
+        // The adapter throws when the hook asks for the protocol version (empty client id), forcing the catch branch.
+        var hooks = new BrokerHooks(_config, LoggerFor(_logs));
+        var args = Args(new MqttConnectPacket { ClientId = "", Username = "meshdev" }, new FakeAdapter(throwOnFormatter: true));
+        await hooks.ValidateConnectionAsync(args);
+
+        Assert.Equal(MqttConnectReasonCode.UnspecifiedError, args.ReasonCode);
+        var line = Assert.Single(_logs.Events, e => e.Level == LogEventLevel.Error);
+        Assert.Contains("meshdev", line.Properties["Username"].ToString());
+        Assert.Contains("203.0.113.7", line.Properties["RemoteIp"].ToString());
+    }
+
+    static ILogger LoggerFor(LogSink sink) => new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(sink).CreateLogger();
+
+    static ValidatingConnectionEventArgs Args(MqttConnectPacket packet, IMqttChannelAdapter adapter) =>
+        new(packet, adapter, new Hashtable(), CancellationToken.None);
 
     [Fact]
     public async Task EmptyClientId_GetsAnAssignedIdOnMqtt5()
@@ -241,18 +289,29 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
         Assert.Equal(MqttClientConnectResultCode.Success, r2.ResultCode);
         Assert.True(second.IsConnected);
 
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (first.IsConnected && DateTime.UtcNow < deadline)
-            await Task.Delay(50, TestContext.Current.CancellationToken);
-        Assert.False(first.IsConnected);
+        Assert.True(await WaitUntil(() => !first.IsConnected));
 
         var clients = await _server.GetClientsAsync();
         Assert.Single(clients, c => c.Id == "!1a2b3c4d");
     }
 
-    sealed class LogSink : ILogEventSink
+    /// <summary>Just enough of a connection for calling the connect hook directly.</summary>
+    sealed class FakeAdapter(bool throwOnFormatter = false) : IMqttChannelAdapter
     {
-        public ConcurrentBag<LogEvent> Events { get; } = new();
-        public void Emit(LogEvent logEvent) => Events.Add(logEvent);
+        readonly MqttPacketFormatterAdapter _formatter = new(MqttProtocolVersion.V311, new MqttBufferWriter(4096, 65535));
+
+        public long BytesReceived => 0;
+        public long BytesSent => 0;
+        public X509Certificate2 ClientCertificate => null!;
+        public EndPoint RemoteEndPoint { get; } = new IPEndPoint(IPAddress.Parse("203.0.113.7"), 40000);
+        public EndPoint LocalEndPoint { get; } = new IPEndPoint(IPAddress.Loopback, 1883);
+        public bool IsSecureConnection => false;
+        public MqttPacketFormatterAdapter PacketFormatterAdapter => throwOnFormatter ? throw new InvalidOperationException("boom") : _formatter;
+        public Task ConnectAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task DisconnectAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<MqttPacket> ReceivePacketAsync(CancellationToken cancellationToken) => Task.FromResult<MqttPacket>(null!);
+        public void ResetStatistics() { }
+        public Task SendPacketAsync(MqttPacket packet, CancellationToken cancellationToken) => Task.CompletedTask;
+        public void Dispose() { }
     }
 }

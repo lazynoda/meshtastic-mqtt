@@ -60,7 +60,8 @@ static class Cli
 
     static async Task<int> RunBrokerAsync(BrokerConfig config, Logger logger)
     {
-        using var server = BrokerServer.Create(config, logger).Server;
+        await using var drops = new DropCounters(logger);
+        using var server = BrokerServer.Create(config, logger, drops: drops).Server;
 
         var stop = new TaskCompletionSource();
         using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; stop.TrySetResult(); });

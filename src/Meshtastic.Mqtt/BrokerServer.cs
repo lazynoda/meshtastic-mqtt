@@ -8,7 +8,8 @@ public static class BrokerServer
 {
     public sealed record Built(MqttServer Server, BrokerHooks Hooks, PacketSizeLimitedTcpAdapter Listener);
 
-    public static Built Create(BrokerConfig config, ILogger logger, int? maxConcurrentKdf = null, bool persistentSessions = false)
+    public static Built Create(BrokerConfig config, ILogger logger, int? maxConcurrentKdf = null,
+        bool persistentSessions = false, DropCounters? drops = null)
     {
         var limits = config.Limits ?? new LimitsConfig();
         var options = new MqttServerOptionsBuilder()
@@ -24,7 +25,7 @@ public static class BrokerServer
         var listener = new PacketSizeLimitedTcpAdapter(config.BindAddress,
             limits.MaxPacketSize ?? LimitsConfig.DefaultMaxPacketSize, logger);
         var server = new MqttServerFactory().CreateMqttServer(options, [listener]);
-        var hooks = new BrokerHooks(config, logger, maxConcurrentKdf);
+        var hooks = new BrokerHooks(config, logger, maxConcurrentKdf, drops);
         hooks.Attach(server);
         return new Built(server, hooks, listener);
     }

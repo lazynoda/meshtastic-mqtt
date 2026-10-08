@@ -8,5 +8,13 @@ namespace Meshtastic.Mqtt.Tests;
 static class TestBroker
 {
     public static MqttServer Create(BrokerConfig config, ILogger logger, int? maxConcurrentKdf = null, bool persistentSessions = false) =>
-        BrokerServer.Create(config, logger, maxConcurrentKdf, persistentSessions).Server;
+        CreateWithHooks(config, logger, maxConcurrentKdf, persistentSessions).Server;
+
+    /// <summary>Also returns a callback that writes the periodic drop summary now.</summary>
+    public static (MqttServer Server, Action FlushDrops) CreateWithHooks(BrokerConfig config, ILogger logger,
+        int? maxConcurrentKdf = null, bool persistentSessions = false)
+    {
+        var built = BrokerServer.Create(config, logger, maxConcurrentKdf, persistentSessions);
+        return (built.Server, built.Hooks.Drops.Flush);
+    }
 }

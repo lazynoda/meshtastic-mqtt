@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Net;
 using System.Security.Cryptography;
 using MQTTnet.Formatter;
+using MQTTnet.Packets;
 using MQTTnet.Protocol;
 using MQTTnet.Server;
 using Serilog;
@@ -12,6 +13,10 @@ namespace Meshtastic.Mqtt;
 /// <remarks>
 /// Every handler catches its own exceptions and fails closed. Logs never contain passwords or
 /// message payloads; client-supplied strings are trimmed before logging.
+///
+/// Log levels: authentication failures and refused connections are Warning, one line per attempt with
+/// username and IP (fail2ban reads them). A refused SUBSCRIBE is one Warning per packet. Dropped publishes are
+/// Debug per packet, plus an Information summary per drop reason every 60 s (see <see cref="DropCounters"/>).
 /// </remarks>
 public sealed class BrokerHooks
 {
@@ -46,7 +51,7 @@ public sealed class BrokerHooks
 
     sealed record ClientIdClaim(string User, object Token, DateTime CreatedUtc, bool Connected);
 
-    public BrokerHooks(BrokerConfig config, ILogger log, int? maxConcurrentKdf = null)
+    public BrokerHooks(BrokerConfig config, ILogger log, int? maxConcurrentKdf = null, DropCounters? drops = null)
     {
         _log = log;
         var users = config.Users ?? [];
@@ -55,9 +60,14 @@ public sealed class BrokerHooks
             TimeSpan.FromSeconds(limits.AuthQueueTimeoutSeconds ?? LimitsConfig.DefaultAuthQueueTimeoutSeconds),
             limits.AuthMaxPending ?? LimitsConfig.DefaultAuthMaxPending);
         _inspector = new PacketInspector(config);
+        Drops = drops ?? new DropCounters(log, start: false);
         foreach (var user in users)
             _subscribeAllow[user.Username] = (user.SubscribeAllow ?? []).ToArray();
     }
+
+    internal DropCounters Drops { get; }
+
+    internal Authenticator Authenticator => _authenticator;
 
     public void Attach(MqttServer server)
     {
@@ -65,15 +75,17 @@ public sealed class BrokerHooks
         server.ValidatingConnectionAsync += ValidateConnectionAsync;
         server.ClientConnectedAsync += OnClientConnectedAsync;
         server.SessionDeletedAsync += OnSessionDeletedAsync;
+        server.InterceptingInboundPacketAsync += InterceptInboundPacketAsync;
         server.InterceptingSubscriptionAsync += InterceptSubscriptionAsync;
         server.InterceptingPublishAsync += InterceptPublishAsync;
     }
 
     public async Task ValidateConnectionAsync(ValidatingConnectionEventArgs args)
     {
+        var remoteIp = "unknown";
         try
         {
-            var remoteIp = (args.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? args.RemoteEndPoint?.ToString() ?? "unknown";
+            remoteIp = (args.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? args.RemoteEndPoint?.ToString() ?? "unknown";
 
             // MQTT 5 requires the server to accept an empty client id and assign one (3.1.1 lets the server
             // refuse it, and MQTTnet does). Assign it up front so a bad password still reports as such.
@@ -82,8 +94,8 @@ public sealed class BrokerHooks
             if (!string.IsNullOrEmpty(args.AuthenticationMethod))
             {
                 args.ReasonCode = MqttConnectReasonCode.BadAuthenticationMethod;
-                _log.Warning("Connection refused: unsupported authentication method {AuthMethod} from {RemoteIp}",
-                    Trim(args.AuthenticationMethod), remoteIp);
+                _log.Warning("Connection refused: unsupported authentication method {AuthMethod} for user {Username} from {RemoteIp}",
+                    Trim(args.AuthenticationMethod), Trim(args.UserName), remoteIp);
                 return;
             }
 
@@ -130,7 +142,8 @@ public sealed class BrokerHooks
         catch (Exception ex)
         {
             args.ReasonCode = MqttConnectReasonCode.UnspecifiedError;
-            _log.Error("Connection check failed for client {ClientId}: {Error}", Trim(args.ClientId), ex.GetType().Name);
+            _log.Error("Connection check failed for user {Username} from {RemoteIp} (client {ClientId}): {Error}",
+                Trim(args.UserName), remoteIp, Trim(args.ClientId), ex.GetType().Name);
         }
     }
 
@@ -236,23 +249,63 @@ public sealed class BrokerHooks
         }
     }
 
+    /// <summary>
+    /// Sees each SUBSCRIBE once, before MQTTnet asks <see cref="InterceptSubscriptionAsync"/> about every filter in
+    /// it, and logs refused filters as one line per packet (a single SUBSCRIBE can carry thousands of filters).
+    /// The decision itself is taken per filter by the same function in <see cref="InterceptSubscriptionAsync"/>.
+    /// </summary>
+    public Task InterceptInboundPacketAsync(InterceptingPacketEventArgs args)
+    {
+        try
+        {
+            if (args.Packet is not MqttSubscribePacket subscribe)
+                return Task.CompletedTask;
+            var owner = args.SessionItems?[OwnerKey] as string;
+            var refused = 0;
+            string? first = null;
+            string? firstReason = null;
+            foreach (var topicFilter in subscribe.TopicFilters)
+            {
+                var (code, reason) = Evaluate(owner, topicFilter.Topic);
+                if (code is null)
+                    continue;
+                refused++;
+                first ??= topicFilter.Topic;
+                firstReason ??= reason;
+            }
+            if (refused > 0)
+            {
+                _log.Warning("Subscribe refused for {Username} (client {ClientId}): {Refused} of {Total} filter(s), first {Filter}: {Reason}",
+                    Trim(owner ?? args.UserName), Trim(args.ClientId), refused, subscribe.TopicFilters.Count, Trim(first), firstReason);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Subscribe logging failed for client {ClientId}: {Error}", Trim(args.ClientId), ex.GetType().Name);
+        }
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Null code = allowed; otherwise the refusal reason code and text.</summary>
+    (MqttSubscribeReasonCode? Code, string Reason) Evaluate(string? owner, string? filter)
+    {
+        if (!TopicFilter.IsValid(filter, out _))
+            return (MqttSubscribeReasonCode.TopicFilterInvalid, "invalid topic filter");
+        var allow = owner is not null && _subscribeAllow.TryGetValue(owner, out var list) ? list : [];
+        return TopicFilter.IsAllowed(allow, filter) ? (null, "allowed") : (MqttSubscribeReasonCode.NotAuthorized, "not in subscribe_allow");
+    }
+
     public Task InterceptSubscriptionAsync(InterceptingSubscriptionEventArgs args)
     {
         try
         {
             var filter = args.TopicFilter?.Topic;
-            if (!TopicFilter.IsValid(filter, out _))
-            {
-                Deny(args, MqttSubscribeReasonCode.TopicFilterInvalid, "invalid topic filter");
-                return Task.CompletedTask;
-            }
-
             // The user bound to the session at connect time, not args.UserName (see OwnerKey).
             var owner = args.SessionItems?[OwnerKey] as string;
-            var allow = owner is not null && _subscribeAllow.TryGetValue(owner, out var list) ? list : [];
-            if (!TopicFilter.IsAllowed(allow, filter))
+            var (code, reason) = Evaluate(owner, filter);
+            if (code is not null)
             {
-                Deny(args, MqttSubscribeReasonCode.NotAuthorized, "not in subscribe_allow");
+                Deny(args, code.Value, reason);
                 return Task.CompletedTask;
             }
 
@@ -271,7 +324,8 @@ public sealed class BrokerHooks
     {
         args.ProcessSubscription = false;
         args.Response.ReasonCode = code;
-        _log.Warning("Subscription {Filter} refused for {Username} (client {ClientId}): {Reason}",
+        // The per-packet Warning is written by InterceptInboundPacketAsync.
+        _log.Debug("Subscription {Filter} refused for {Username} (client {ClientId}): {Reason}",
             Trim(args.TopicFilter?.Topic), Trim(args.UserName), Trim(args.ClientId), reason);
     }
 
@@ -287,7 +341,8 @@ public sealed class BrokerHooks
             if (!result.Accepted)
             {
                 args.ProcessPublish = false;
-                _log.Information("Dropped publish on {Topic} from {ClientId}: {Reason} (from {From}, id {PacketId})",
+                Drops.Increment(result.Reason);
+                _log.Debug("Dropped publish on {Topic} from {ClientId}: {Reason} (from {From}, id {PacketId})",
                     Trim(topic), Trim(args.ClientId), result.Reason, NodeId(result.From), result.PacketId);
                 return Task.CompletedTask;
             }
@@ -307,6 +362,7 @@ public sealed class BrokerHooks
         catch (Exception ex)
         {
             args.ProcessPublish = false;
+            Drops.Increment("internal error");
             _log.Error("Publish check failed for client {ClientId}: {Error}", Trim(args.ClientId), ex.GetType().Name);
         }
         return Task.CompletedTask;
