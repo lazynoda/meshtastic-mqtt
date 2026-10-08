@@ -21,6 +21,8 @@ drop_pki: true
 default_psk: "AQ=="
 
 # Channel name (exactly as the firmware sends it in channel_id / the topic) -> base64 PSK.
+# Names are case-sensitive: the firmware hashes the exact name, so "Test" and "test" are different channels
+# (an unlisted "test" uses default_psk).
 # Single-byte keys follow the firmware expansion: AQ== is the default key, Ag== the default key + 1, etc.
 # Source: meshtastic-es-community.github.io (docs/guias-basicas/configuracion-inicial.mdx and
 # src/components/MeshtasticConfigGenerator/config.ts). SFNarrow, Iberia and the provincial channels,

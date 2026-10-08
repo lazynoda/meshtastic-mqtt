@@ -31,7 +31,10 @@ public sealed class BrokerConfig
     [YamlIgnore] public IPAddress BindAddress { get; private set; } = IPAddress.Any;
     [YamlIgnore] public byte[] DefaultKey { get; private set; } = [];
 
-    /// <summary>Expanded keys. Lookup ignores case, like firmware <c>Channels::getByName()</c> (strcasecmp).</summary>
+    /// <summary>
+    /// Expanded keys. Lookup is case-sensitive: the firmware hashes the channel name with its exact case
+    /// (<c>Channels::generateHash()</c>), so <c>Test</c> and <c>test</c> are different channels on the mesh.
+    /// </summary>
     [YamlIgnore] public IReadOnlyDictionary<string, byte[]> ChannelKeyMap { get; private set; } = new Dictionary<string, byte[]>();
 
     internal List<string> Validate()
@@ -57,17 +60,14 @@ public sealed class BrokerConfig
         else
             DefaultKey = defaultKey;
 
-        var keyMap = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        // Exact-case names, like the firmware channel hash. A name repeated with the same case is a YAML
+        // duplicate key, not something this map can see.
+        var keyMap = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         foreach (var (name, psk) in Channels ?? [])
         {
             if (string.IsNullOrWhiteSpace(name) || name.IndexOfAny(['/', '+', '#', '\0']) >= 0)
             {
                 errors.Add($"channels: '{name}' is not a usable channel name (empty, or contains '/', '+' or '#')");
-                continue;
-            }
-            if (keyMap.ContainsKey(name))
-            {
-                errors.Add($"channels: '{name}' is listed twice (channel names are matched ignoring case)");
                 continue;
             }
             if (!ChannelKeys.TryExpand(psk, out var key, out var keyError))

@@ -109,9 +109,14 @@ FIXTURES = {
                                       b"fixture-payload-test", "!1a2b3c4d"),
     "valencia_va.bin": encrypted_envelope("Valencia", "VA==", 0x1A2B3C4D, 0x10000003, 1,
                                           b"fixture-payload-valencia", "!1a2b3c4d"),
-    # Channel `test` (lower case) keyed with Ag==, for the smoke-test user allowed msh/ES/2/e/test/#.
+    # Channel `test` (lower case) keyed with Ag==. Channel names are case-sensitive (the firmware hashes the
+    # exact name), so a broker configured with `Test: Ag==` reads this one with default_psk: undecryptable.
     "test_lower_ag.bin": encrypted_envelope("test", "Ag==", 0x1A2B3C4D, 0x10000004, 1,
                                             b"fixture-payload-test-lower", "!1a2b3c4d"),
+    # Channel `test` (lower case) on the default key: a different channel from `Test`, decryptable with AQ==.
+    # Used by the integration and smoke tests for the user allowed msh/ES/2/e/test/#.
+    "test_lower_aq.bin": encrypted_envelope("test", "AQ==", 0x1A2B3C4D, 0x10000008, 1,
+                                            b"fixture-payload-test-lower-aq", "!1a2b3c4d"),
     # A `Test` packet encrypted with the wrong key (AQ== instead of Ag==): must be undecryptable.
     "test_wrong_key_aq.bin": encrypted_envelope("Test", "AQ==", 0x1A2B3C4D, 0x10000005, 1,
                                                 b"fixture-payload-wrong-key", "!1a2b3c4d"),

@@ -35,6 +35,8 @@ A message is forwarded only if all of these hold:
 4. The packet has non-zero `from` and `id` and carries an `encrypted` payload of 1-256 bytes
    (plaintext `decoded` packets are dropped).
 5. Channel packets: the key is looked up **by channel name** (`channels`, falling back to `default_psk`).
+   The lookup is case-sensitive, like the firmware: the channel hash covers the exact name, so `Test` and
+   `test` are different channels and a `test` channel not listed under `channels` uses `default_psk`.
    The packet is decrypted with AES-CTR exactly as the firmware does; it counts as decryptable when the
    result parses as `Data` with a portnum other than `UNKNOWN_APP` (the firmware's own test in
    `Router.cpp perhapsDecode()`). Keys are never tried one after another.
@@ -78,7 +80,7 @@ Start from [`config.example.yaml`](config.example.yaml).
 | `drop_undecryptable` | `true` | Drop channel packets that do not decrypt with their channel's key. |
 | `drop_pki` | `true` | Drop PKI-encrypted DMs (see above). |
 | `default_psk` | `AQ==` | Base64 PSK for any channel not listed under `channels`. |
-| `channels` | empty | Map of channel name → base64 PSK. Names are matched ignoring case, like the firmware. |
+| `channels` | empty | Map of channel name → base64 PSK. Names are **case-sensitive** (exact match, like the firmware's channel hash). |
 | `users[].username` | required | Case-sensitive. |
 | `users[].password_hash` | required | `pbkdf2-sha256$<iterations>$<salt>$<hash>`, see below. |
 | `users[].subscribe_allow` | empty | MQTT topic filters this user may subscribe within. Empty = no subscribe at all. |

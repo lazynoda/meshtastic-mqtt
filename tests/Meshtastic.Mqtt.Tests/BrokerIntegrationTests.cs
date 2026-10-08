@@ -149,7 +149,7 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
 
         await Publish("msh/ES/2/e/test/!1a2b3c4d", "garbage.bin");
         await Publish("msh/ES/2/e/test/!1a2b3c4d", "test_wrong_key_aq.bin");   // channel_id Test != topic test
-        await Publish("msh/ES/2/e/test/!1a2b3c4d", "test_lower_ag.bin", retain: true);
+        await Publish("msh/ES/2/e/test/!1a2b3c4d", "test_lower_aq.bin", retain: true);
 
         var deadline = DateTime.UtcNow.AddSeconds(5);
         while (received.IsEmpty && DateTime.UtcNow < deadline)
@@ -157,7 +157,7 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
         await Task.Delay(300, TestContext.Current.CancellationToken);
 
         var only = Assert.Single(received);
-        Assert.StartsWith("msh/ES/2/e/test/!1a2b3c4d 72 retain=False", only);
+        Assert.StartsWith("msh/ES/2/e/test/!1a2b3c4d 75 retain=False", only);
         Assert.DoesNotContain(_logs.Events, e => e.RenderMessage().Contains("fixture-payload"));
     }
 

@@ -32,7 +32,7 @@ public class PublishFilterTests
     [InlineData("msh/ES/2/e/SFNarrow/!1a2b3c4d", "sfnarrow_aq.bin", "SFNarrow")]
     [InlineData("msh/ES/2/e/Test/!1a2b3c4d", "test_ag.bin", "Test")]
     [InlineData("msh/ES/2/e/Valencia/!1a2b3c4d", "valencia_va.bin", "Valencia")]
-    [InlineData("msh/ES/2/e/test/!1a2b3c4d", "test_lower_ag.bin", "test")]
+    [InlineData("msh/ES/2/e/test/!1a2b3c4d", "test_lower_aq.bin", "test")]
     [InlineData("msh/EU_868/2/e/LongFast/!fa8165a4", "longfast_real.bin", "LongFast")]
     public void ValidPackets_PassWithTheirChannelKey(string topic, string fixture, string channel)
     {
@@ -41,6 +41,18 @@ public class PublishFilterTests
         Assert.Equal(channel, r.Channel);
         Assert.NotNull(r.Portnum);
         Assert.True(r.ChannelHashMatches);
+    }
+
+    [Fact]
+    public void ChannelKeyLookup_IsCaseSensitive()
+    {
+        // `test` is not `Test` (the firmware hashes the exact name): with only `Test: Ag==` configured, a `test`
+        // channel uses default_psk. Its default-key traffic passes; Ag==-keyed traffic on it is undecryptable.
+        var lowerDefault = Inspect("msh/ES/2/e/test/!1a2b3c4d", Fixture("test_lower_aq.bin"));
+        Assert.True(lowerDefault.Accepted, lowerDefault.Reason);
+        var lowerAg = Inspect("msh/ES/2/e/test/!1a2b3c4d", Fixture("test_lower_ag.bin"));
+        Assert.False(lowerAg.Accepted);
+        Assert.Contains("undecryptable", lowerAg.Reason);
     }
 
     [Fact]

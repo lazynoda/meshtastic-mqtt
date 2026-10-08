@@ -50,10 +50,16 @@ public class ConfigTests
     }
 
     [Fact]
-    public void ChannelLookup_IgnoresCase()
+    public void ChannelLookup_IsCaseSensitive()
     {
-        var c = ConfigLoader.Parse(Minimal("channels:\n  Test: Ag=="));
-        Assert.True(c.ChannelKeyMap.ContainsKey("test"));
+        // The firmware hashes the exact channel name (Channels::generateHash), so `Test` and `test` are
+        // different channels on the mesh and may carry different keys.
+        var c = ConfigLoader.Parse(Minimal("channels:\n  Test: Ag==\n  test: AQ=="));
+        ChannelKeys.TryExpand("Ag==", out var ag, out _);
+        ChannelKeys.TryExpand("AQ==", out var aq, out _);
+        Assert.Equal(ag, c.ChannelKeyMap["Test"]);
+        Assert.Equal(aq, c.ChannelKeyMap["test"]);
+        Assert.False(ConfigLoader.Parse(Minimal("channels:\n  Test: Ag==")).ChannelKeyMap.ContainsKey("test"));
     }
 
     [Theory]
@@ -63,7 +69,6 @@ public class ConfigTests
     [InlineData("log_level: chatty", "log_level")]
     [InlineData("default_psk: '***'", "default_psk")]
     [InlineData("channels:\n  Test: '***'", "channels.Test")]
-    [InlineData("channels:\n  Test: Ag==\n  test: AQ==", "listed twice")]
     [InlineData("channels:\n  'a/b': AQ==", "channel name")]
     [InlineData("listener:\n  prot: 1883", "prot")]                         // unknown key = typo, not ignored
     [InlineData("drop_undecryptable: maybe", "maybe")]
