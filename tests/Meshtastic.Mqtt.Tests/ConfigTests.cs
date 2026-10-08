@@ -1,0 +1,124 @@
+using System.Net;
+using Meshtastic.Mqtt;
+using Xunit;
+
+namespace Meshtastic.Mqtt.Tests;
+
+public class ConfigTests
+{
+    const string Hash = AuthTests.AliceHash;
+
+    static string Minimal(string extra = "") => $"""
+        users:
+          - username: meshdev
+            password_hash: "{Hash}"
+        {extra}
+        """;
+
+    [Fact]
+    public void Minimal_UsesSafeDefaults()
+    {
+        var c = ConfigLoader.Parse(Minimal());
+        Assert.Equal(1883, c.Listener.Port);
+        Assert.Equal(IPAddress.Any, c.BindAddress);
+        Assert.True(c.DropUndecryptable);
+        Assert.True(c.DropPki);
+        Assert.Equal("AQ==", c.DefaultPsk);
+        Assert.Empty(c.Users![0].SubscribeAllow!);
+        Assert.Equal(Serilog.Events.LogEventLevel.Information, c.MinimumLevel);
+    }
+
+    [Fact]
+    public void ExampleConfig_IsValidAndMatchesTheSpanishMesh()
+    {
+        var c = ConfigLoader.LoadFile(Path.Combine(AppContext.BaseDirectory, "config.example.yaml"));
+        var meshdev = Assert.Single(c.Users!);
+        Assert.Equal("meshdev", meshdev.Username);
+        Assert.Empty(meshdev.SubscribeAllow!);
+        Assert.True(meshdev.ParsedHash!.Verify("large4cats"u8));
+        Assert.True(c.DropUndecryptable);
+        Assert.True(c.DropPki);
+
+        ChannelKeys.TryExpand("AQ==", out var aq, out _);
+        ChannelKeys.TryExpand("Ag==", out var ag, out _);
+        ChannelKeys.TryExpand("VA==", out var va, out _);
+        Assert.Equal(aq, c.DefaultKey);
+        Assert.Equal(ag, c.ChannelKeyMap["Test"]);
+        Assert.Equal(ag, c.ChannelKeyMap["Bots"]);
+        Assert.Equal(va, c.ChannelKeyMap["Valencia"]);
+        Assert.False(c.ChannelKeyMap.ContainsKey("Zaragoza"));   // stays on default_psk
+    }
+
+    [Fact]
+    public void ChannelLookup_IgnoresCase()
+    {
+        var c = ConfigLoader.Parse(Minimal("channels:\n  Test: Ag=="));
+        Assert.True(c.ChannelKeyMap.ContainsKey("test"));
+    }
+
+    [Theory]
+    [InlineData("listener:\n  port: 0", "listener.port")]
+    [InlineData("listener:\n  port: 70000", "listener.port")]
+    [InlineData("listener:\n  bind_address: localhost", "listener.bind_address")]
+    [InlineData("log_level: chatty", "log_level")]
+    [InlineData("default_psk: '***'", "default_psk")]
+    [InlineData("channels:\n  Test: '***'", "channels.Test")]
+    [InlineData("channels:\n  Test: Ag==\n  test: AQ==", "listed twice")]
+    [InlineData("channels:\n  'a/b': AQ==", "channel name")]
+    [InlineData("listener:\n  prot: 1883", "prot")]                         // unknown key = typo, not ignored
+    [InlineData("drop_undecryptable: maybe", "maybe")]
+    public void InvalidValues_FailWithAClearMessage(string extra, string mentions)
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));
+        Assert.Contains(mentions, ex.Message);
+    }
+
+    [Fact]
+    public void PlaintextPassword_IsRejected()
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse("users:\n  - username: meshdev\n    password_hash: large4cats\n"));
+        Assert.Contains("password_hash", ex.Message);
+    }
+
+    [Fact]
+    public void InvalidSubscribeFilter_IsRejected()
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(
+            $"users:\n  - username: a\n    password_hash: \"{Hash}\"\n    subscribe_allow: ['msh/#/x']\n"));
+        Assert.Contains("subscribe_allow", ex.Message);
+    }
+
+    [Fact]
+    public void DuplicateUser_IsRejected()
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(
+            $"users:\n  - username: a\n    password_hash: \"{Hash}\"\n  - username: a\n    password_hash: \"{Hash}\"\n"));
+        Assert.Contains("defined twice", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("users: []")]
+    [InlineData("log_level: debug")]
+    public void NoUsers_IsRejected(string yaml) =>
+        Assert.Throws<ConfigException>(() => ConfigLoader.Parse(yaml));
+
+    [Fact]
+    public void BrokenYaml_ReportsTheLine()
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse("users:\n  - username: [unclosed\n"));
+        Assert.Contains("line", ex.Message);
+    }
+
+    [Fact]
+    public void ErrorMessages_NeverEchoAPasswordHash()
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(
+            $"log_level: nope\nusers:\n  - username: a\n    password_hash: \"{Hash}\"\n"));
+        Assert.DoesNotContain(Hash, ex.Message);
+    }
+
+    [Fact]
+    public void MissingFile_IsAConfigError() =>
+        Assert.Throws<ConfigException>(() => ConfigLoader.LoadFile("/nonexistent/config.yaml"));
+}

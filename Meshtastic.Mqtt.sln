@@ -4,6 +4,8 @@ VisualStudioVersion = 17.5.2.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Meshtastic.Mqtt", "src\Meshtastic.Mqtt\Meshtastic.Mqtt.csproj", "{7467C293-5E7D-1ADF-451D-7E36BDAC9410}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Meshtastic.Mqtt.Tests", "tests\Meshtastic.Mqtt.Tests\Meshtastic.Mqtt.Tests.csproj", "{3B1E8D2A-6C4F-4E7B-9A1D-2F5C8E0B7A41}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -14,6 +16,10 @@ Global
 		{7467C293-5E7D-1ADF-451D-7E36BDAC9410}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{7467C293-5E7D-1ADF-451D-7E36BDAC9410}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{7467C293-5E7D-1ADF-451D-7E36BDAC9410}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3B1E8D2A-6C4F-4E7B-9A1D-2F5C8E0B7A41}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3B1E8D2A-6C4F-4E7B-9A1D-2F5C8E0B7A41}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3B1E8D2A-6C4F-4E7B-9A1D-2F5C8E0B7A41}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3B1E8D2A-6C4F-4E7B-9A1D-2F5C8E0B7A41}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
