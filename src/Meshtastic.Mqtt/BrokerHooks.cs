@@ -8,7 +8,7 @@ using Serilog;
 
 namespace Meshtastic.Mqtt;
 
-/// <summary>MQTTnet hooks: connect (auth) and subscribe (ACL).</summary>
+/// <summary>The three MQTTnet hooks: connect (auth), subscribe (ACL), publish (packet filter).</summary>
 /// <remarks>
 /// Every handler catches its own exceptions and fails closed. Logs never contain passwords or
 /// message payloads; client-supplied strings are trimmed before logging.
@@ -17,6 +17,7 @@ public sealed class BrokerHooks
 {
     readonly ILogger _log;
     readonly Authenticator _authenticator;
+    readonly PacketInspector _inspector;
     readonly Dictionary<string, IReadOnlyCollection<string>> _subscribeAllow = new(StringComparer.Ordinal);
 
     public BrokerHooks(BrokerConfig config, ILogger log, int? maxConcurrentKdf = null)
@@ -24,6 +25,7 @@ public sealed class BrokerHooks
         _log = log;
         var users = config.Users ?? [];
         _authenticator = new Authenticator(users, maxConcurrentKdf);
+        _inspector = new PacketInspector(config);
         foreach (var user in users)
             _subscribeAllow[user.Username] = (user.SubscribeAllow ?? []).ToArray();
     }
@@ -32,6 +34,7 @@ public sealed class BrokerHooks
     {
         server.ValidatingConnectionAsync += ValidateConnectionAsync;
         server.InterceptingSubscriptionAsync += InterceptSubscriptionAsync;
+        server.InterceptingPublishAsync += InterceptPublishAsync;
     }
 
     public async Task ValidateConnectionAsync(ValidatingConnectionEventArgs args)
@@ -107,6 +110,45 @@ public sealed class BrokerHooks
         _log.Warning("Subscription {Filter} refused for {Username} (client {ClientId}): {Reason}",
             Trim(args.TopicFilter?.Topic), Trim(args.UserName), Trim(args.ClientId), reason);
     }
+
+    public Task InterceptPublishAsync(InterceptingPublishEventArgs args)
+    {
+        try
+        {
+            var message = args.ApplicationMessage;
+            var topic = message?.Topic;
+            var payload = message is null ? [] : message.Payload.ToArray();
+            var result = _inspector.Inspect(topic, payload);
+
+            if (!result.Accepted)
+            {
+                args.ProcessPublish = false;
+                _log.Information("Dropped publish on {Topic} from {ClientId}: {Reason} (from {From}, id {PacketId})",
+                    Trim(topic), Trim(args.ClientId), result.Reason, NodeId(result.From), result.PacketId);
+                return Task.CompletedTask;
+            }
+
+            // Firmware never publishes retained packets. Refusing retain keeps public publishers from
+            // filling the retained-message store with one entry per topic they invent.
+            message!.Retain = false;
+            args.ProcessPublish = true;
+            _log.Debug("Accepted publish on {Topic} from {ClientId}: {Reason} (from {From}, id {PacketId}, portnum {Portnum})",
+                Trim(topic), Trim(args.ClientId), result.Reason, NodeId(result.From), result.PacketId, result.Portnum);
+            if (result.ChannelHashMatches == false)
+            {
+                _log.Debug("Channel hash mismatch on {Topic}: packet hash differs from the configured key for {Channel}",
+                    Trim(topic), result.Channel);
+            }
+        }
+        catch (Exception ex)
+        {
+            args.ProcessPublish = false;
+            _log.Error("Publish check failed for client {ClientId}: {Error}", Trim(args.ClientId), ex.GetType().Name);
+        }
+        return Task.CompletedTask;
+    }
+
+    static string NodeId(uint node) => $"!{node:x8}";
 
     /// <summary>Bounds and de-controls client-supplied strings before they reach the log.</summary>
     internal static string Trim(string? value, int max = 128)
