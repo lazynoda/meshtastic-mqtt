@@ -32,6 +32,16 @@ channels:
   Bots: "Ag=="
   Valencia: "VA=="   # byte 84; note that "Va==" would be a different key
 
+# Protection against hostile clients. These are the defaults; the section can be left out.
+limits:
+  # Largest MQTT packet accepted (fixed-header Remaining Length, bytes). Checked before the broker allocates
+  # the packet, so it also bounds unauthenticated CONNECTs. Firmware packets are far smaller: a ServiceEnvelope
+  # carries at most a 256-byte MeshPacket plus a few dozen bytes of ids, and the firmware's MQTT client buffer
+  # is 1024 bytes. 4096 leaves room for long topics and MQTT 5 properties. Range 512-1048576.
+  max_packet_size: 4096
+  # How long a client may take to send CONNECT, and how long a write may stall, in seconds (MQTTnet: 100).
+  communication_timeout_seconds: 10
+
 users:
   # Firmware default credentials (meshdev / large4cats). Public by design, so uplink only:
   # no subscribe_allow means this user cannot subscribe to anything.

@@ -35,6 +35,8 @@ public sealed class BrokerConfig
 
     public List<UserConfig>? Users { get; set; } = new();
 
+    public LimitsConfig? Limits { get; set; } = new();
+
     [YamlIgnore] public LogEventLevel MinimumLevel { get; private set; } = LogEventLevel.Information;
     [YamlIgnore] public IPAddress BindAddress { get; private set; } = IPAddress.Any;
     [YamlIgnore] public byte[] DefaultKey { get; private set; } = [];
@@ -54,6 +56,11 @@ public sealed class BrokerConfig
             errors.Add("drop_undecryptable: empty value; write true or false (leave the key out to use the default, true)");
         if (DropPkiSetting is null)
             errors.Add("drop_pki: empty value; write true or false (leave the key out to use the default, true)");
+
+        if (Limits is null)
+            errors.Add("limits: empty section; leave it out to use the defaults or set its keys");
+        else
+            Limits.Validate(errors);
 
         if (Listener.Port is < 1 or > 65535)
             errors.Add($"listener.port: {Listener.Port} is not a valid TCP port (1-65535)");
@@ -152,6 +159,36 @@ public sealed class ListenerConfig
 {
     public string BindAddress { get; set; } = "0.0.0.0";
     public int Port { get; set; } = 1883;
+}
+
+/// <summary>Resource limits that protect the broker from hostile clients, before and during authentication.</summary>
+public sealed class LimitsConfig
+{
+    public const int DefaultMaxPacketSize = 4096;
+    public const int MinMaxPacketSize = 512;
+    public const int MaxMaxPacketSize = 1024 * 1024;
+    public const int DefaultCommunicationTimeoutSeconds = 10;
+
+    /// <summary>
+    /// Largest MQTT packet accepted, counted as the fixed header's Remaining Length. Enforced while the header is
+    /// read, before MQTTnet allocates the body, so it also bounds unauthenticated CONNECTs.
+    /// </summary>
+    public int? MaxPacketSize { get; set; } = DefaultMaxPacketSize;
+
+    /// <summary>MQTTnet's DefaultCommunicationTimeout: how long a client may take to send CONNECT, and a write may stall.</summary>
+    public int? CommunicationTimeoutSeconds { get; set; } = DefaultCommunicationTimeoutSeconds;
+
+    internal void Validate(List<string> errors)
+    {
+        Check(errors, "max_packet_size", MaxPacketSize, MinMaxPacketSize, MaxMaxPacketSize);
+        Check(errors, "communication_timeout_seconds", CommunicationTimeoutSeconds, 1, 300);
+    }
+
+    static void Check(List<string> errors, string key, int? value, int min, int max)
+    {
+        if (value is null || value < min || value > max)
+            errors.Add($"limits.{key}: {(value is null ? "empty value" : value.ToString())} is not an integer between {min} and {max}");
+    }
 }
 
 public sealed class UserConfig

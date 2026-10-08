@@ -60,25 +60,7 @@ static class Cli
 
     static async Task<int> RunBrokerAsync(BrokerConfig config, Logger logger)
     {
-        var options = new MqttServerOptionsBuilder()
-            .WithDefaultEndpoint()
-            .WithDefaultEndpointPort(config.Listener.Port)
-            .Build();
-        // MQTTnet opens one IPv4 and one IPv6 socket; bind only the family of the configured address.
-        var endpoint = options.DefaultEndpointOptions;
-        if (config.BindAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-        {
-            endpoint.BoundInterNetworkAddress = config.BindAddress;
-            endpoint.BoundInterNetworkV6Address = System.Net.IPAddress.None;
-        }
-        else
-        {
-            endpoint.BoundInterNetworkAddress = System.Net.IPAddress.None;
-            endpoint.BoundInterNetworkV6Address = config.BindAddress;
-        }
-
-        using var server = new MqttServerFactory().CreateMqttServer(options);
-        new BrokerHooks(config, logger).Attach(server);
+        using var server = BrokerServer.Create(config, logger).Server;
 
         var stop = new TaskCompletionSource();
         using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; stop.TrySetResult(); });
@@ -94,8 +76,10 @@ static class Cli
             return 1;
         }
 
-        logger.Information("Listening on {Address}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_undecryptable={DropUndecryptable}, drop_pki={DropPki}",
-            config.BindAddress, config.Listener.Port, config.Users!.Count, config.ChannelKeyMap.Count, config.DropUndecryptable, config.DropPki);
+        var limits = config.Limits!;
+        logger.Information("Listening on {Address}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_undecryptable={DropUndecryptable}, drop_pki={DropPki}, max_packet_size={MaxPacketSize}, communication_timeout_seconds={CommunicationTimeout}",
+            config.BindAddress, config.Listener.Port, config.Users!.Count, config.ChannelKeyMap.Count, config.DropUndecryptable, config.DropPki,
+            limits.MaxPacketSize, limits.CommunicationTimeoutSeconds);
 
         await stop.Task;
         logger.Information("Shutting down");

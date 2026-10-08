@@ -47,6 +47,8 @@ public class ConfigTests
         Assert.Equal(ag, c.ChannelKeyMap["Bots"]);
         Assert.Equal(va, c.ChannelKeyMap["Valencia"]);
         Assert.False(c.ChannelKeyMap.ContainsKey("Zaragoza"));   // stays on default_psk
+        Assert.Equal(4096, c.Limits!.MaxPacketSize);
+        Assert.Equal(10, c.Limits.CommunicationTimeoutSeconds);
     }
 
     [Fact]
@@ -124,6 +126,31 @@ public class ConfigTests
     {
         var c = ConfigLoader.Parse(Minimal("channels:\n  Open: AA=="));
         Assert.Empty(c.ChannelKeyMap["Open"]);
+    }
+
+    [Fact]
+    public void Limits_HaveSafeDefaults_AndCanBeSet()
+    {
+        var d = ConfigLoader.Parse(Minimal()).Limits!;
+        Assert.Equal(4096, d.MaxPacketSize);
+        Assert.Equal(10, d.CommunicationTimeoutSeconds);
+
+        var c = ConfigLoader.Parse(Minimal("limits:\n  max_packet_size: 2048\n  communication_timeout_seconds: 5")).Limits!;
+        Assert.Equal(2048, c.MaxPacketSize);
+        Assert.Equal(5, c.CommunicationTimeoutSeconds);
+    }
+
+    [Theory]
+    [InlineData("limits:\n  max_packet_size: 100", "limits.max_packet_size")]
+    [InlineData("limits:\n  max_packet_size: 268435455", "limits.max_packet_size")]
+    [InlineData("limits:\n  max_packet_size:", "limits.max_packet_size")]
+    [InlineData("limits:\n  communication_timeout_seconds: 0", "limits.communication_timeout_seconds")]
+    [InlineData("limits:", "limits")]
+    [InlineData("limits:\n  max_packet: 4096", "max_packet")]
+    public void InvalidLimits_AreRejected(string extra, string mentions)
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));
+        Assert.Contains(mentions, ex.Message);
     }
 
     [Theory]

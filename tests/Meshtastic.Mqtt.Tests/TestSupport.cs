@@ -69,3 +69,7 @@ static class TestSupport
         public void Emit(LogEvent logEvent) => Events.Enqueue(logEvent);
     }
 }
+
+/// <summary>Timing- and memory-sensitive tests run alone, after the parallel ones.</summary>
+[CollectionDefinition("Isolated", DisableParallelization = true)]
+public sealed class IsolatedCollection;
