@@ -9,9 +9,6 @@ using Microsoft.Extensions.Hosting;
 using Serilog.Formatting.Compact;
 using Meshtastic.Crypto;
 using Meshtastic;
-using System.Security.Authentication;
-using System.Security.Cryptography.X509Certificates;
-using System.Reflection;
 
 await RunMqttServer(args);
 
@@ -40,25 +37,11 @@ async Task RunMqttServer(string[] args)
 
 MqttServerOptions BuildMqttServerOptions()
 {
-    var currentPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!;
-
-    #pragma warning disable SYSLIB0057 // Type or member is obsolete
-    var certificate = new X509Certificate2(
-        Path.Combine(currentPath, "certificate.pfx"),
-        "large4cats",
-        X509KeyStorageFlags.Exportable);
-    #pragma warning restore SYSLIB0057
-
-    var options = new MqttServerOptionsBuilder()
-        .WithoutDefaultEndpoint()
-        .WithEncryptedEndpoint()
-        .WithEncryptedEndpointPort(8883)
-        .WithEncryptionCertificate(certificate.Export(X509ContentType.Pfx))
-        .WithEncryptionSslProtocol(SslProtocols.Tls12)
+    // Plain MQTT on 1883. The TLS listener and its committed certificate are gone.
+    return new MqttServerOptionsBuilder()
+        .WithDefaultEndpoint()
+        .WithDefaultEndpointPort(1883)
         .Build();
-
-    Log.Logger.Information("Using SSL certificate for MQTT server");
-    return options;
 }
 
 void ConfigureMqttServer(MqttServer mqttServer)

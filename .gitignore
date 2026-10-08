@@ -53,3 +53,12 @@ CodeCoverage/
 TestResult.xml
 nunit-*.xml
 .DS_Store
+
+# Secrets: never commit keys, certificates or a real broker config
+key.pem
+cert.pem
+certificate.pfx
+*.pem
+*.pfx
+*.key
+config.yaml
