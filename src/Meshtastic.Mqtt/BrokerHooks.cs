@@ -50,7 +50,10 @@ public sealed class BrokerHooks
     {
         _log = log;
         var users = config.Users ?? [];
-        _authenticator = new Authenticator(users, maxConcurrentKdf);
+        var limits = config.Limits ?? new LimitsConfig();
+        _authenticator = new Authenticator(users, maxConcurrentKdf,
+            TimeSpan.FromSeconds(limits.AuthQueueTimeoutSeconds ?? LimitsConfig.DefaultAuthQueueTimeoutSeconds),
+            limits.AuthMaxPending ?? LimitsConfig.DefaultAuthMaxPending);
         _inspector = new PacketInspector(config);
         foreach (var user in users)
             _subscribeAllow[user.Username] = (user.SubscribeAllow ?? []).ToArray();
@@ -84,7 +87,18 @@ public sealed class BrokerHooks
                 return;
             }
 
-            if (!await _authenticator.AuthenticateAsync(args.UserName, args.RawPassword, args.CancellationToken).ConfigureAwait(false))
+            // MQTTnet does not expose a per-connection token here (args.CancellationToken is the server's);
+            // the authenticator's own queue timeout bounds the wait instead.
+            var auth = await _authenticator.AuthenticateAsync(args.UserName, args.RawPassword, args.CancellationToken).ConfigureAwait(false);
+            if (auth == AuthResult.Busy)
+            {
+                // Not an authentication failure (the password was not checked), so worded differently for fail2ban.
+                args.ReasonCode = MqttConnectReasonCode.ServerBusy;
+                _log.Warning("Connection refused: password check queue full, retry later (user {Username} from {RemoteIp}, client {ClientId})",
+                    Trim(args.UserName), remoteIp, Trim(args.ClientId));
+                return;
+            }
+            if (auth != AuthResult.Success)
             {
                 args.ReasonCode = MqttConnectReasonCode.BadUserNameOrPassword;
                 _log.Warning("Authentication failed for user {Username} from {RemoteIp} (client {ClientId})",

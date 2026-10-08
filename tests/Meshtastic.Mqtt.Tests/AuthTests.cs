@@ -29,18 +29,18 @@ public class AuthTests
     public async Task CorrectPasswords_Authenticate()
     {
         var auth = Build();
-        Assert.True(await auth.AuthenticateAsync("meshdev", Pw("large4cats"), TestContext.Current.CancellationToken));
-        Assert.True(await auth.AuthenticateAsync("alice", Pw("correct-horse"), TestContext.Current.CancellationToken));
+        Assert.Equal(AuthResult.Success, await auth.AuthenticateAsync("meshdev", Pw("large4cats"), TestContext.Current.CancellationToken));
+        Assert.Equal(AuthResult.Success, await auth.AuthenticateAsync("alice", Pw("correct-horse"), TestContext.Current.CancellationToken));
     }
 
     [Fact]
     public async Task CachedSuccess_StillRejectsWrongPassword()
     {
         var auth = Build();
-        Assert.True(await auth.AuthenticateAsync("meshdev", Pw("large4cats"), TestContext.Current.CancellationToken));
-        Assert.True(await auth.AuthenticateAsync("meshdev", Pw("large4cats"), TestContext.Current.CancellationToken));
-        Assert.False(await auth.AuthenticateAsync("meshdev", Pw("large4cats "), TestContext.Current.CancellationToken));
-        Assert.False(await auth.AuthenticateAsync("meshdev", Pw("Large4cats"), TestContext.Current.CancellationToken));
+        Assert.Equal(AuthResult.Success, await auth.AuthenticateAsync("meshdev", Pw("large4cats"), TestContext.Current.CancellationToken));
+        Assert.Equal(AuthResult.Success, await auth.AuthenticateAsync("meshdev", Pw("large4cats"), TestContext.Current.CancellationToken));
+        Assert.Equal(AuthResult.Failed, await auth.AuthenticateAsync("meshdev", Pw("large4cats "), TestContext.Current.CancellationToken));
+        Assert.Equal(AuthResult.Failed, await auth.AuthenticateAsync("meshdev", Pw("Large4cats"), TestContext.Current.CancellationToken));
     }
 
     [Theory]
@@ -51,14 +51,96 @@ public class AuthTests
     [InlineData("nobody", "large4cats")]
     [InlineData("", "large4cats")]
     public async Task BadCredentials_AreRejected(string user, string password) =>
-        Assert.False(await Build().AuthenticateAsync(user, Pw(password), TestContext.Current.CancellationToken));
+        Assert.Equal(AuthResult.Failed, await Build().AuthenticateAsync(user, Pw(password), TestContext.Current.CancellationToken));
 
     [Fact]
     public async Task NullCredentials_AreRejected()
     {
         var auth = Build();
-        Assert.False(await auth.AuthenticateAsync(null, null, TestContext.Current.CancellationToken));
-        Assert.False(await auth.AuthenticateAsync("meshdev", null, TestContext.Current.CancellationToken));
+        Assert.Equal(AuthResult.Failed, await auth.AuthenticateAsync(null, null, TestContext.Current.CancellationToken));
+        Assert.Equal(AuthResult.Failed, await auth.AuthenticateAsync("meshdev", null, TestContext.Current.CancellationToken));
+    }
+
+    static Authenticator Build(int slots, TimeSpan timeout, int maxPending)
+    {
+        var config = ConfigLoader.Parse($"users:\n  - username: meshdev\n    password_hash: \"{MeshdevHash}\"\n");
+        return new Authenticator(config.Users!, slots, timeout, maxPending);
+    }
+
+    [Fact]
+    public async Task ConcurrentLoginsWithTheSamePassword_ShareOneKdf()
+    {
+        var auth = Build(slots: 1, TimeSpan.FromSeconds(30), maxPending: 64);
+        var results = await Task.WhenAll(Enumerable.Range(0, 12)
+            .Select(_ => auth.AuthenticateAsync("meshdev", Pw("large4cats"), TestContext.Current.CancellationToken)));
+        Assert.All(results, r => Assert.Equal(AuthResult.Success, r));
+        Assert.Equal(1, auth.KdfRuns);
+    }
+
+    [Fact]
+    public async Task ConcurrentWrongPasswords_AreAllRejected()
+    {
+        // Coalescing is per (user, password): a wrong password never rides on a right one.
+        var auth = Build(slots: 1, TimeSpan.FromSeconds(30), maxPending: 64);
+        var good = auth.AuthenticateAsync("meshdev", Pw("large4cats"), TestContext.Current.CancellationToken);
+        var bad = auth.AuthenticateAsync("meshdev", Pw("large4dogs"), TestContext.Current.CancellationToken);
+        Assert.Equal(AuthResult.Success, await good);
+        Assert.Equal(AuthResult.Failed, await bad);
+    }
+
+    [Fact]
+    public async Task QueueOverflow_AnswersBusy_WithoutRunningTheKdf()
+    {
+        var auth = Build(slots: 1, TimeSpan.FromSeconds(30), maxPending: 2);
+        var calls = Enumerable.Range(0, 10)
+            .Select(i => auth.AuthenticateAsync("meshdev", Pw($"wrong-{i}"), TestContext.Current.CancellationToken))
+            .ToArray();
+        var results = await Task.WhenAll(calls);
+        Assert.Equal(2, results.Count(r => r == AuthResult.Failed));
+        Assert.Equal(8, results.Count(r => r == AuthResult.Busy));
+        Assert.Equal(2, auth.KdfRuns);
+    }
+
+    [Fact]
+    public async Task QueueTimeout_AnswersBusy()
+    {
+        var auth = Build(slots: 1, TimeSpan.FromMilliseconds(100), maxPending: 64);
+        var results = await Task.WhenAll(Enumerable.Range(0, 6)
+            .Select(i => auth.AuthenticateAsync("meshdev", Pw($"wrong-{i}"), TestContext.Current.CancellationToken)));
+        Assert.Contains(AuthResult.Busy, results);
+        Assert.True(auth.KdfRuns < 6);
+    }
+
+    [Fact]
+    public async Task UnknownUsernames_UseTheirOwnLane()
+    {
+        // Unknown usernames saturate their single slot; a configured user is checked in its own lane.
+        var auth = Build(slots: 1, TimeSpan.FromSeconds(30), maxPending: 4);
+        var flood = Enumerable.Range(0, 20)
+            .Select(i => auth.AuthenticateAsync($"nobody{i}", Pw("x"), TestContext.Current.CancellationToken))
+            .ToArray();
+        Assert.Equal(AuthResult.Success, await auth.AuthenticateAsync("meshdev", Pw("large4cats"), TestContext.Current.CancellationToken));
+        var floodResults = await Task.WhenAll(flood);
+        Assert.DoesNotContain(AuthResult.Success, floodResults);
+        Assert.Contains(AuthResult.Busy, floodResults);
+    }
+
+    [Fact]
+    public async Task MostAwaitedCheck_RunsFirst()
+    {
+        // 10 different wrong passwords for meshdev are queued first, then 10 nodes log in with the real one.
+        // The real password has 10 waiters, each guess has 1: it runs right after the check already started.
+        var auth = Build(slots: 1, TimeSpan.FromSeconds(30), maxPending: 64);
+        var ct = TestContext.Current.CancellationToken;
+        var guesses = Enumerable.Range(0, 10).Select(i => auth.AuthenticateAsync("meshdev", Pw($"guess-{i}"), ct)).ToArray();
+        var nodes = Enumerable.Range(0, 10).Select(_ => auth.AuthenticateAsync("meshdev", Pw("large4cats"), ct)).ToArray();
+
+        var results = await Task.WhenAll(nodes);
+        var guessesDoneFirst = guesses.Count(t => t.IsCompleted);
+        Assert.All(results, r => Assert.Equal(AuthResult.Success, r));
+        // Only the guess that had already started may finish before the real password is served.
+        Assert.True(guessesDoneFirst <= 1, $"the real password waited for {guessesDoneFirst} guesses");
+        Assert.All(await Task.WhenAll(guesses), r => Assert.Equal(AuthResult.Failed, r));
     }
 
     [Fact]

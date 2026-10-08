@@ -49,6 +49,8 @@ public class ConfigTests
         Assert.False(c.ChannelKeyMap.ContainsKey("Zaragoza"));   // stays on default_psk
         Assert.Equal(4096, c.Limits!.MaxPacketSize);
         Assert.Equal(10, c.Limits.CommunicationTimeoutSeconds);
+        Assert.Equal(3, c.Limits.AuthQueueTimeoutSeconds);
+        Assert.Equal(64, c.Limits.AuthMaxPending);
     }
 
     [Fact]
@@ -134,10 +136,14 @@ public class ConfigTests
         var d = ConfigLoader.Parse(Minimal()).Limits!;
         Assert.Equal(4096, d.MaxPacketSize);
         Assert.Equal(10, d.CommunicationTimeoutSeconds);
+        Assert.Equal(3, d.AuthQueueTimeoutSeconds);
+        Assert.Equal(64, d.AuthMaxPending);
 
-        var c = ConfigLoader.Parse(Minimal("limits:\n  max_packet_size: 2048\n  communication_timeout_seconds: 5")).Limits!;
+        var c = ConfigLoader.Parse(Minimal("limits:\n  max_packet_size: 2048\n  communication_timeout_seconds: 5\n  auth_queue_timeout_seconds: 2\n  auth_max_pending: 8")).Limits!;
         Assert.Equal(2048, c.MaxPacketSize);
         Assert.Equal(5, c.CommunicationTimeoutSeconds);
+        Assert.Equal(2, c.AuthQueueTimeoutSeconds);
+        Assert.Equal(8, c.AuthMaxPending);
     }
 
     [Theory]
@@ -145,6 +151,8 @@ public class ConfigTests
     [InlineData("limits:\n  max_packet_size: 268435455", "limits.max_packet_size")]
     [InlineData("limits:\n  max_packet_size:", "limits.max_packet_size")]
     [InlineData("limits:\n  communication_timeout_seconds: 0", "limits.communication_timeout_seconds")]
+    [InlineData("limits:\n  auth_queue_timeout_seconds: 0", "limits.auth_queue_timeout_seconds")]
+    [InlineData("limits:\n  auth_max_pending: 0", "limits.auth_max_pending")]
     [InlineData("limits:", "limits")]
     [InlineData("limits:\n  max_packet: 4096", "max_packet")]
     public void InvalidLimits_AreRejected(string extra, string mentions)

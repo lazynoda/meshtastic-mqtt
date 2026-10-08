@@ -20,7 +20,7 @@ exposed on the internet:
 
 | Hook | Rule |
 |---|---|
-| Connect | Username and password are checked against `users`. Unknown user or wrong password → `BadUserNameOrPassword` (MQTT 3.1.1 return code 4), logged with username and remote IP, never the password. A reconnect with an existing client id takes over the old session, but only for the **same user**: a client id held by a live or persisted session of another user is refused with `ClientIdentifierNotValid` (3.1.1 return code 2) and the session owner stays connected. The id is free again once that session is gone. |
+| Connect | Username and password are checked against `users`. Unknown user or wrong password → `BadUserNameOrPassword` (MQTT 3.1.1 return code 4), logged with username and remote IP, never the password. A reconnect with an existing client id takes over the old session, but only for the **same user**: a client id held by a live or persisted session of another user is refused with `ClientIdentifierNotValid` (3.1.1 return code 2) and the session owner stays connected. The id is free again once that session is gone. If the password-check queue is full (see `limits`), the client gets `ServerBusy` (3.1.1 return code 3, "server unavailable") and retries. |
 | Subscribe | The requested filter is granted only if **every** topic it can match is covered by the `subscribe_allow` filters of the user that **created the session** (bound at connect time, so a reused session never changes hands). Real MQTT wildcard semantics, not prefix matching. An empty or missing list denies everything. `#` and `+` never grant `$`-topics such as `$SYS/#`. Refusal → MQTT 5 reason `Not authorized` (135); on MQTT 3.1.1 → `0x80`. |
 | Publish | See below. Accepted messages are re-published with `retain` cleared (firmware never retains), so nothing enters the retained-message store. |
 
@@ -91,6 +91,8 @@ Start from [`config.example.yaml`](config.example.yaml).
 | `users[].subscribe_allow` | empty | MQTT topic filters this user may subscribe within. Empty = no subscribe at all. |
 | `limits.max_packet_size` | `4096` | Largest MQTT packet accepted, in bytes (Remaining Length). Checked before the packet is allocated; a larger one closes the connection. Range 512-1048576. |
 | `limits.communication_timeout_seconds` | `10` | How long a new connection may take to send CONNECT, and a write may stall (MQTTnet's default is 100). |
+| `limits.auth_queue_timeout_seconds` | `3` | How long a login may wait for a password-hashing slot before it is answered "server busy". |
+| `limits.auth_max_pending` | `64` | Logins that may run or wait for password hashing at once (separately for configured users and for unknown usernames). Further logins get "server busy" without hashing. |
 
 ### Limits
 
@@ -100,6 +102,13 @@ The firmware's MQTT client buffer is 1024 bytes (`src/mqtt/MQTT.cpp`, `setBuffer
 cannot send anything larger. 4096 leaves room for long topics and MQTT 5 properties. MQTTnet itself has no
 such limit and would allocate whatever a client announces (up to 256 MB) before reading it, which is why
 the check runs in the broker's own TCP listener, on the raw bytes.
+
+Logins pay PBKDF2 only when the password is not already known (see below). Those checks run in two
+queues, one for configured usernames and one for unknown usernames, each bounded by `auth_max_pending`
+and `auth_queue_timeout_seconds`, so a flood of bad logins can neither grow memory without bound nor keep
+legitimate users waiting. Simultaneous logins with the same username and password (a fleet of `meshdev`
+nodes reconnecting after a broker restart) share one PBKDF2 computation, and the check with the most logins
+waiting on it runs first, so the real `meshdev` password jumps ahead of an attacker's one-off guesses.
 
 ### Channel keys
 
@@ -143,7 +152,7 @@ The firmware-default `meshdev` / `large4cats` credentials are public by design; 
 
 Logins are rate-friendly: a password verified once is remembered (as a SHA-256 digest, one per
 configured user) so thousands of nodes reconnecting with `meshdev` do not each pay PBKDF2. Failed
-and unknown-user logins always pay the full cost, with a cap on how many run in parallel.
+and unknown-user logins always pay the full cost, in bounded queues (see [Limits](#limits)).
 
 ## Running with Docker
 
