@@ -1,0 +1,45 @@
+# Meshtastic MQTT broker configuration.
+# Copy to config.yaml (git-ignored), adjust, and mount it read-only into the container.
+
+listener:
+  bind_address: 0.0.0.0   # IPv4 or IPv6 literal; "::" listens on IPv6 only
+  port: 1883              # plain MQTT, no TLS in this version
+
+# verbose | debug | information | warning | error | fatal
+# "debug" also logs every accepted packet (topic, client, from, id, portnum; never the payload).
+log_level: information
+
+# Drop channel packets that do not decrypt with the key configured for their channel
+# (private channels, wrong keys, garbage).
+drop_undecryptable: true
+
+# Drop PKI-encrypted direct messages (topic <root>/2/e/PKI/<gateway>). The broker can never decrypt
+# them; set to false to pass them through opaquely so that downlink gateways can deliver DMs.
+drop_pki: true
+
+# Key for any channel not listed under `channels` (AQ== = the firmware default key).
+default_psk: "AQ=="
+
+# Channel name (exactly as the firmware sends it in channel_id / the topic) -> base64 PSK.
+# Single-byte keys follow the firmware expansion: AQ== is the default key, Ag== the default key + 1, etc.
+# Source: meshtastic-es-community.github.io (docs/guias-basicas/configuracion-inicial.mdx and
+# src/components/MeshtasticConfigGenerator/config.ts). SFNarrow, Iberia and the provincial channels,
+# Zaragoza included, use the default key and need no entry.
+channels:
+  Test: "Ag=="
+  Bots: "Ag=="
+  Valencia: "VA=="   # byte 84; note that "Va==" would be a different key
+
+users:
+  # Firmware default credentials (meshdev / large4cats). Public by design, so uplink only:
+  # no subscribe_allow means this user cannot subscribe to anything.
+  # Generate a hash with: docker run --rm -i <image> hash-password
+  - username: meshdev
+    password_hash: "pbkdf2-sha256$600000$iqngz3pWU8HFZn8xIv8/IQ==$ZhdEPkHgqnG2zbHe26j6U598nTyFTA8J/Kzm7WCxDuA="
+
+  # Example downlink user: may subscribe only to filters fully inside these MQTT topic filters.
+  # "msh/ES/2/e/Test/#" allows msh/ES/2/e/Test/# and anything below it, but never msh/# or msh/ES/2/e/+/#.
+  # - username: dashboard
+  #   password_hash: "pbkdf2-sha256$600000$<salt>$<hash>"
+  #   subscribe_allow:
+  #     - "msh/ES/2/e/#"

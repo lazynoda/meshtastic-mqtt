@@ -1,187 +1,146 @@
-﻿using MQTTnet.Server;
-using Meshtastic.Protobufs;
-using Google.Protobuf;
+﻿using System.Runtime.InteropServices;
+using System.Text;
+using Meshtastic.Mqtt;
+using MQTTnet.Server;
 using Serilog;
-using MQTTnet.Protocol;
-using System.Runtime.Loader;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
+using Serilog.Core;
 using Serilog.Formatting.Compact;
-using Meshtastic.Crypto;
-using Meshtastic;
 
-await RunMqttServer(args);
+return await Cli.RunAsync(args);
 
-async Task RunMqttServer(string[] args)
+static class Cli
 {
-    Log.Logger = new LoggerConfiguration()
-        .MinimumLevel.Debug()
-        .WriteTo.Console(new RenderedCompactJsonFormatter())
-        // .WriteTo.File(new RenderedCompactJsonFormatter(), "log.json", rollingInterval: RollingInterval.Hour)
-        .CreateLogger();
+    const string Usage = """
+        Usage:
+          Meshtastic.Mqtt [config.yaml]       run the broker (or set MESHTASTIC_MQTT_CONFIG)
+          Meshtastic.Mqtt hash-password       read a password from stdin, print its hash for the config
+        """;
 
-    using var mqttServer = new MqttServerFactory()
-        .CreateMqttServer(BuildMqttServerOptions());
-    ConfigureMqttServer(mqttServer);
-
-    // Set up host
-    using var host = CreateHostBuilder(args).Build();
-    await host.StartAsync();
-    var lifetime = host.Services.GetRequiredService<IHostApplicationLifetime>();
-
-    await mqttServer.StartAsync();
-
-    // Configure graceful shutdown
-    await SetupGracefulShutdown(mqttServer, lifetime, host);
-}
-
-MqttServerOptions BuildMqttServerOptions()
-{
-    // Plain MQTT on 1883. The TLS listener and its committed certificate are gone.
-    return new MqttServerOptionsBuilder()
-        .WithDefaultEndpoint()
-        .WithDefaultEndpointPort(1883)
-        .Build();
-}
-
-void ConfigureMqttServer(MqttServer mqttServer)
-{
-    mqttServer.InterceptingPublishAsync += HandleInterceptingPublish;
-    mqttServer.InterceptingSubscriptionAsync += HandleInterceptingSubscription;
-    mqttServer.ValidatingConnectionAsync += HandleValidatingConnection;
-}
-
-async Task HandleInterceptingPublish(InterceptingPublishEventArgs args)
-{
-    try 
+    public static async Task<int> RunAsync(string[] args)
     {
-        if (args.ApplicationMessage.Payload.Length == 0)
+        if (args is ["hash-password"])
+            return HashPassword();
+        if (args is ["-h"] or ["--help"])
         {
-            Log.Logger.Warning("Received empty payload on topic {@Topic} from {@ClientId}", args.ApplicationMessage.Topic, args.ClientId);
-            args.ProcessPublish = false;
-            return;
+            Console.Out.WriteLine(Usage);
+            return 0;
+        }
+        if (args.Length > 1)
+        {
+            Console.Error.WriteLine(Usage);
+            return 2;
         }
 
-        var serviceEnvelope = ServiceEnvelope.Parser.ParseFrom(args.ApplicationMessage.Payload);
-
-        if (!IsValidServiceEnvelope(serviceEnvelope))
+        var path = args.Length == 1 ? args[0] : Environment.GetEnvironmentVariable(ConfigLoader.EnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(path))
         {
-            Log.Logger.Warning("Service envelope or packet is malformed. Blocking packet on topic {@Topic} from {@ClientId}",
-                args.ApplicationMessage.Topic, args.ClientId);
-            args.ProcessPublish = false;
-            return;
+            Console.Error.WriteLine($"No config file: pass its path as the only argument or set {ConfigLoader.EnvironmentVariable}.");
+            Console.Error.WriteLine(Usage);
+            return 2;
         }
 
-        // Spot for any async operations we might want to perform
-        await Task.FromResult(0);
-
-        var data = DecryptMeshPacket(serviceEnvelope);
-
-        // Uncomment to block unrecognized packets
-        // if (data == null)
-        // {
-        //     Log.Logger.Warning("Service envelope does not contain a valid packet. Blocking packet");
-        //     args.ProcessPublish = false;
-        //     return;
-        // }
-
-        LogReceivedMessage(args.ApplicationMessage.Topic, args.ClientId, data);
-        args.ProcessPublish = true;
-    }
-    catch (InvalidProtocolBufferException)
-    {
-        Log.Logger.Warning("Failed to decode presumed protobuf packet. Blocking");
-        args.ProcessPublish = false;
-    }
-    catch (Exception ex)
-    {
-        Log.Logger.Error("Exception occurred while processing packet on {@Topic} from {@ClientId}: {@Exception}",
-            args.ApplicationMessage.Topic, args.ClientId, ex.Message);
-        args.ProcessPublish = false;
-    }
-}
-
-Task HandleInterceptingSubscription(InterceptingSubscriptionEventArgs args)
-{
-    // Add filtering logic here if needed
-    args.ProcessSubscription = true;
-    return Task.CompletedTask;
-}
-
-Task HandleValidatingConnection(ValidatingConnectionEventArgs args)
-{
-    // Add connection / authentication logic here if needed
-    args.ReasonCode = MqttConnectReasonCode.Success;
-    return Task.CompletedTask;
-}
-
-bool IsValidServiceEnvelope(ServiceEnvelope serviceEnvelope)
-{
-    return !(String.IsNullOrWhiteSpace(serviceEnvelope.ChannelId) ||
-            String.IsNullOrWhiteSpace(serviceEnvelope.GatewayId) ||
-            serviceEnvelope.Packet == null ||
-            serviceEnvelope.Packet.Id < 1 ||
-            serviceEnvelope.Packet.From < 1 ||
-            serviceEnvelope.Packet.Encrypted == null ||
-            serviceEnvelope.Packet.Encrypted.Length < 1 ||
-            serviceEnvelope.Packet.Decoded != null);
-}
-
-void LogReceivedMessage(string topic, string clientId, Data? data)
-{
-    if (data?.Portnum == PortNum.TextMessageApp)
-    {
-        Log.Logger.Information("Received text message on topic {@Topic} from {@ClientId}: {@Message}",
-            topic, clientId, data.Payload.ToStringUtf8());
-    }
-    else
-    {
-        Log.Logger.Information("Received packet on topic {@Topic} from {@ClientId} with port number: {@Portnum}",
-            topic, clientId, data?.Portnum);
-    }
-}
-
-static Data? DecryptMeshPacket(ServiceEnvelope serviceEnvelope)
-{
-    var nonce = new NonceGenerator(serviceEnvelope.Packet.From, serviceEnvelope.Packet.Id).Create();
-    var decrypted = PacketEncryption.TransformPacket(serviceEnvelope.Packet.Encrypted.ToByteArray(), nonce, Resources.DEFAULT_PSK);
-    var payload = Data.Parser.ParseFrom(decrypted);
-
-    if (payload.Portnum > PortNum.UnknownApp && payload.Payload.Length > 0)
-        return payload;
-
-    return null;
-}
-
-async Task SetupGracefulShutdown(MqttServer mqttServer, IHostApplicationLifetime lifetime, IHost host)
-{
-    var ended = new ManualResetEventSlim();
-    var starting = new ManualResetEventSlim();
-
-    AssemblyLoadContext.Default.Unloading += ctx =>
-    {
-        starting.Set();
-        Log.Logger.Debug("Waiting for completion");
-        ended.Wait();
-    };
-
-    starting.Wait();
-
-    Log.Logger.Debug("Received signal gracefully shutting down");
-    await mqttServer.StopAsync();
-    Thread.Sleep(500);
-    ended.Set();
-
-    lifetime.StopApplication();
-    await host.WaitForShutdownAsync();
-}
-
-static IHostBuilder CreateHostBuilder(string[] args)
-{
-    return Host.CreateDefaultBuilder(args)
-        .UseConsoleLifetime()
-        .ConfigureServices((hostContext, services) =>
+        BrokerConfig config;
+        try
         {
-            services.AddSingleton(Console.Out);
-        });
+            config = ConfigLoader.LoadFile(path);
+        }
+        catch (ConfigException ex)
+        {
+            Console.Error.WriteLine($"Invalid config '{path}':{Environment.NewLine}{ex.Message}");
+            return 1;
+        }
+
+        await using var logger = new LoggerConfiguration()
+            .MinimumLevel.ControlledBy(new LoggingLevelSwitch(config.MinimumLevel))
+            .WriteTo.Console(new RenderedCompactJsonFormatter())
+            .CreateLogger();
+
+        return await RunBrokerAsync(config, logger);
+    }
+
+    static async Task<int> RunBrokerAsync(BrokerConfig config, Logger logger)
+    {
+        var options = new MqttServerOptionsBuilder()
+            .WithDefaultEndpoint()
+            .WithDefaultEndpointPort(config.Listener.Port)
+            .Build();
+        // MQTTnet opens one IPv4 and one IPv6 socket; bind only the family of the configured address.
+        var endpoint = options.DefaultEndpointOptions;
+        if (config.BindAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+        {
+            endpoint.BoundInterNetworkAddress = config.BindAddress;
+            endpoint.BoundInterNetworkV6Address = System.Net.IPAddress.None;
+        }
+        else
+        {
+            endpoint.BoundInterNetworkAddress = System.Net.IPAddress.None;
+            endpoint.BoundInterNetworkV6Address = config.BindAddress;
+        }
+
+        using var server = new MqttServerFactory().CreateMqttServer(options);
+        new BrokerHooks(config, logger).Attach(server);
+
+        var stop = new TaskCompletionSource();
+        using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; stop.TrySetResult(); });
+        using var sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; stop.TrySetResult(); });
+
+        try
+        {
+            await server.StartAsync();
+        }
+        catch (Exception ex)
+        {
+            logger.Fatal("Cannot start the MQTT listener on {Address}:{Port}: {Error}", config.BindAddress, config.Listener.Port, ex.Message);
+            return 1;
+        }
+
+        logger.Information("Listening on {Address}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_undecryptable={DropUndecryptable}, drop_pki={DropPki}",
+            config.BindAddress, config.Listener.Port, config.Users!.Count, config.ChannelKeyMap.Count, config.DropUndecryptable, config.DropPki);
+
+        await stop.Task;
+        logger.Information("Shutting down");
+        await server.StopAsync();
+        return 0;
+    }
+
+    static int HashPassword()
+    {
+        string? password;
+        if (Console.IsInputRedirected)
+        {
+            password = Console.In.ReadLine();
+        }
+        else
+        {
+            Console.Error.Write("Password: ");
+            password = ReadHidden();
+        }
+        if (string.IsNullOrEmpty(password))
+        {
+            Console.Error.WriteLine("Empty password.");
+            return 1;
+        }
+        Console.Out.WriteLine(PasswordHasher.Hash(password));
+        return 0;
+    }
+
+    static string ReadHidden()
+    {
+        var sb = new StringBuilder();
+        while (true)
+        {
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Enter)
+                break;
+            if (key.Key == ConsoleKey.Backspace)
+            {
+                if (sb.Length > 0)
+                    sb.Length--;
+                continue;
+            }
+            sb.Append(key.KeyChar);
+        }
+        Console.Error.WriteLine();
+        return sb.ToString();
+    }
 }
