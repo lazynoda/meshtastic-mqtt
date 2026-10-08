@@ -13,17 +13,25 @@ public sealed class BrokerConfig
     public ListenerConfig Listener { get; set; } = new();
     public string LogLevel { get; set; } = "information";
 
+    // The two security flags are nullable on the YAML side only so that an empty value
+    // (`drop_pki:` or `drop_pki: ~`) is reported as an error instead of silently turning into false.
+    [YamlMember(Alias = "drop_undecryptable", ApplyNamingConventions = false)]
+    public bool? DropUndecryptableSetting { get; set; } = true;
+
+    [YamlMember(Alias = "drop_pki", ApplyNamingConventions = false)]
+    public bool? DropPkiSetting { get; set; } = true;
+
     /// <summary>Drop channel packets the broker cannot decrypt with the key configured for their channel.</summary>
-    public bool DropUndecryptable { get; set; } = true;
+    [YamlIgnore] public bool DropUndecryptable => DropUndecryptableSetting ?? true;
 
     /// <summary>Drop PKI-encrypted DMs (channel_id "PKI"). They can never be decrypted by the broker.</summary>
-    public bool DropPki { get; set; } = true;
+    [YamlIgnore] public bool DropPki => DropPkiSetting ?? true;
 
     /// <summary>Key for any channel not listed in <see cref="Channels"/>.</summary>
-    public string DefaultPsk { get; set; } = "AQ==";
+    public string? DefaultPsk { get; set; } = "AQ==";
 
     /// <summary>Channel name (as in ServiceEnvelope.channel_id) to base64 PSK.</summary>
-    public Dictionary<string, string>? Channels { get; set; } = new();
+    public Dictionary<string, string?>? Channels { get; set; } = new();
 
     public List<UserConfig>? Users { get; set; } = new();
 
@@ -42,6 +50,11 @@ public sealed class BrokerConfig
         var errors = new List<string>();
         Listener ??= new ListenerConfig();
 
+        if (DropUndecryptableSetting is null)
+            errors.Add("drop_undecryptable: empty value; write true or false (leave the key out to use the default, true)");
+        if (DropPkiSetting is null)
+            errors.Add("drop_pki: empty value; write true or false (leave the key out to use the default, true)");
+
         if (Listener.Port is < 1 or > 65535)
             errors.Add($"listener.port: {Listener.Port} is not a valid TCP port (1-65535)");
         if (!IPAddress.TryParse(Listener.BindAddress, out var bind)
@@ -55,19 +68,26 @@ public sealed class BrokerConfig
         else
             MinimumLevel = level;
 
-        if (!ChannelKeys.TryExpand(DefaultPsk, out var defaultKey, out var defaultError))
+        if (string.IsNullOrEmpty(DefaultPsk))
+            errors.Add($"default_psk: {EmptyPskError}");
+        else if (!ChannelKeys.TryExpand(DefaultPsk, out var defaultKey, out var defaultError))
             errors.Add($"default_psk: {defaultError}");
         else
             DefaultKey = defaultKey;
 
-        // Exact-case names, like the firmware channel hash. A name repeated with the same case is a YAML
-        // duplicate key, not something this map can see.
+        // Exact-case names, like the firmware channel hash. Exact duplicates never get here: the YAML
+        // parser rejects duplicate keys.
         var keyMap = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         foreach (var (name, psk) in Channels ?? [])
         {
             if (string.IsNullOrWhiteSpace(name) || name.IndexOfAny(['/', '+', '#', '\0']) >= 0)
             {
                 errors.Add($"channels: '{name}' is not a usable channel name (empty, or contains '/', '+' or '#')");
+                continue;
+            }
+            if (string.IsNullOrEmpty(psk))
+            {
+                errors.Add($"channels.{name}: {EmptyPskError}");
                 continue;
             }
             if (!ChannelKeys.TryExpand(psk, out var key, out var keyError))
@@ -112,6 +132,10 @@ public sealed class BrokerConfig
         }
         return errors;
     }
+
+    // The firmware reads an empty PSK on a secondary channel as "use the primary channel's key", not as
+    // "no encryption", so an empty value here is ambiguous and almost always an editing mistake.
+    const string EmptyPskError = "empty PSK; write the base64 key (\"AA==\" means no encryption, \"AQ==\" is the default key)";
 
     static readonly Dictionary<string, LogEventLevel> LogLevels = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -165,6 +189,7 @@ public static class ConfigLoader
     {
         var deserializer = new DeserializerBuilder()
             .WithNamingConvention(UnderscoredNamingConvention.Instance)
+            .WithDuplicateKeyChecking()   // a repeated key (users:, a channel) must not silently replace the first
             .Build();
 
         BrokerConfig? config;

@@ -63,6 +63,70 @@ public class ConfigTests
     }
 
     [Theory]
+    [InlineData("drop_undecryptable:", "drop_undecryptable")]
+    [InlineData("drop_undecryptable: ~", "drop_undecryptable")]
+    [InlineData("drop_pki:", "drop_pki")]
+    [InlineData("drop_pki: null", "drop_pki")]
+    public void NullBoolean_IsRejected(string extra, string mentions)
+    {
+        // An empty value must not silently turn a security filter off.
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));
+        Assert.Contains(mentions, ex.Message);
+        Assert.Contains("true or false", ex.Message);
+    }
+
+    [Fact]
+    public void AbsentBooleans_KeepTheirDefaults()
+    {
+        var c = ConfigLoader.Parse(Minimal());
+        Assert.True(c.DropUndecryptable);
+        Assert.True(c.DropPki);
+        var off = ConfigLoader.Parse(Minimal("drop_undecryptable: false\ndrop_pki: false"));
+        Assert.False(off.DropUndecryptable);
+        Assert.False(off.DropPki);
+    }
+
+    [Theory]
+    [InlineData("channels:\n  Valencia: VA==\n  Valencia: AQ==", "Valencia")]                 // same channel twice
+    [InlineData("log_level: debug\nlog_level: information", "log_level")]
+    [InlineData("listener:\n  port: 1883\n  port: 1884", "port")]
+    public void DuplicateKeys_AreRejected(string extra, string mentions)
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));
+        Assert.Contains("Duplicate key", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(mentions, ex.Message);
+    }
+
+    [Fact]
+    public void DuplicateUsersBlock_IsRejected()
+    {
+        // Two `users:` blocks used to keep only the second one, silently dropping users.
+        var yaml = $"users:\n  - username: a\n    password_hash: \"{Hash}\"\nusers:\n  - username: b\n    password_hash: \"{Hash}\"\n";
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(yaml));
+        Assert.Contains("users", ex.Message);
+    }
+
+    [Theory]
+    [InlineData("default_psk:", "default_psk")]
+    [InlineData("default_psk: ''", "default_psk")]
+    [InlineData("default_psk: ~", "default_psk")]
+    [InlineData("channels:\n  Test:", "channels.Test")]
+    [InlineData("channels:\n  Test: ''", "channels.Test")]
+    public void EmptyPsk_IsRejected_AndPointsAtAA(string extra, string mentions)
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));
+        Assert.Contains(mentions, ex.Message);
+        Assert.Contains("\"AA==\" means no encryption", ex.Message);
+    }
+
+    [Fact]
+    public void ExplicitNoEncryptionPsk_IsAccepted()
+    {
+        var c = ConfigLoader.Parse(Minimal("channels:\n  Open: AA=="));
+        Assert.Empty(c.ChannelKeyMap["Open"]);
+    }
+
+    [Theory]
     [InlineData("listener:\n  port: 0", "listener.port")]
     [InlineData("listener:\n  port: 70000", "listener.port")]
     [InlineData("listener:\n  bind_address: localhost", "listener.bind_address")]

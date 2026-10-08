@@ -68,7 +68,8 @@ The broker can never decrypt them, so they get their own flag instead of falling
 
 The config is YAML. Pass its path as the only argument, or set `MESHTASTIC_MQTT_CONFIG`
 (the Docker image defaults to `/config/config.yaml`). The broker refuses to start, listing every
-problem, if the file is invalid, including unknown keys (typos are errors, not ignored).
+problem, if the file is invalid: unknown keys (typos are errors, not ignored), a key written twice,
+an empty `true`/`false` value and an empty PSK are all errors.
 
 Start from [`config.example.yaml`](config.example.yaml).
 
@@ -77,8 +78,8 @@ Start from [`config.example.yaml`](config.example.yaml).
 | `listener.bind_address` | `0.0.0.0` | IPv4 or IPv6 literal to listen on (`::` = IPv6 only). |
 | `listener.port` | `1883` | TCP port (plain MQTT). |
 | `log_level` | `information` | `verbose`, `debug`, `information`, `warning`, `error`, `fatal`. `debug` also logs every accepted packet. |
-| `drop_undecryptable` | `true` | Drop channel packets that do not decrypt with their channel's key. |
-| `drop_pki` | `true` | Drop PKI-encrypted DMs (see above). |
+| `drop_undecryptable` | `true` | Drop channel packets that do not decrypt with their channel's key. Must be `true` or `false` if present. |
+| `drop_pki` | `true` | Drop PKI-encrypted DMs (see above). Must be `true` or `false` if present. |
 | `default_psk` | `AQ==` | Base64 PSK for any channel not listed under `channels`. |
 | `channels` | empty | Map of channel name → base64 PSK. Names are **case-sensitive** (exact match, like the firmware's channel hash). |
 | `users[].username` | required | Case-sensitive. |
@@ -90,7 +91,8 @@ Start from [`config.example.yaml`](config.example.yaml).
 PSKs use the same encoding as the firmware and the apps (base64). Expansion follows
 `Channels::getKey()` in the firmware:
 
-- 1 byte `0` (`AA==`) or empty: no encryption.
+- 1 byte `0` (`AA==`): no encryption. An empty value is a config error (the firmware reads an empty
+  key on a secondary channel as "use the primary channel's key", so it is ambiguous); write `AA==`.
 - 1 byte `N ≥ 1`: the default key with its last byte increased by `N-1`
   (`AQ==` = default key, `Ag==` = default + 1, `VA==` = byte 84).
 - 2-15 bytes are zero-padded to 16 (AES-128), 17-31 to 32 (AES-256); 16 and 32 are used as is.
