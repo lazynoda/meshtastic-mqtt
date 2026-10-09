@@ -28,28 +28,54 @@ public sealed class BrokerHooks
     internal const string OwnerKey = "meshtastic-mqtt.owner";
 
     /// <summary>SessionItems key holding the claim token of the CONNECT that created the session.</summary>
-    const string ClaimTokenKey = "meshtastic-mqtt.claim";
+    internal const string ClaimTokenKey = "meshtastic-mqtt.claim";
 
     /// <summary>
     /// How long a client id stays reserved for a user that passed authentication but has not finished connecting.
-    /// Covers the gap between the connect hook and MQTTnet creating the session.
+    /// Covers the gap between the connect hook and MQTTnet creating the session. Settable for tests.
     /// </summary>
-    static readonly TimeSpan PendingClaimLifetime = TimeSpan.FromSeconds(30);
+    internal TimeSpan PendingClaimLifetime { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// A sweep of the claim table runs on the first insert after this many inserts, or after
+    /// <see cref="PendingClaimLifetime"/> has passed since the last sweep, whichever comes first.
+    /// </summary>
+    internal const int SweepEveryInserts = 64;
 
     readonly ILogger _log;
     readonly Authenticator _authenticator;
     readonly PacketInspector _inspector;
     readonly Dictionary<string, IReadOnlyCollection<string>> _subscribeAllow = new(StringComparer.Ordinal);
 
-    // Client id -> user owning it, mirroring MQTTnet's session store. A claim is taken when a CONNECT passes
-    // authentication and removed when its session is deleted (SessionDeleted, matched by token so that a late
-    // event for an old session cannot drop a newer claim). A claim whose session has vanished without an event
-    // (persistent sessions expire lazily) is detected on the next conflicting CONNECT and replaced, so a client
-    // id can never be locked out for good. Bounded by the number of sessions, not by what clients send.
+    // Client id -> user owning it, mirroring MQTTnet's session store. A claim is taken (pending) when a CONNECT
+    // passes authentication, marked connected when MQTTnet reports the client connected, and removed when its
+    // session is deleted.
+    // - SessionDeleted releases the claim that tracks the deleted session (same token), and any same-user claim
+    //   that is still pending: MQTTnet reuses the old session (and its token) on a CleanSession=false reconnect,
+    //   so a reconnect that dies before ClientConnected ends with the old session's token and a pending claim of
+    //   the same user, which the vanished session no longer protects.
+    // - ClientConnected runs after the CONNACK, so the client it reports may already have been replaced or have
+    //   died. Tokens are sequenced: it never overwrites a newer connected claim, and it takes its own claim back
+    //   when the session it was attached to is no longer the server's session for the id.
+    // - Safety net for whatever neither event covers (persistent sessions expire lazily, without an event): on
+    //   insert, every SweepEveryInserts inserts or once per PendingClaimLifetime, claims older than the lifetime
+    //   whose id has no session in the server are removed. A conflicting CONNECT also replaces such a claim at
+    //   once, so no client id is ever locked out for good.
+    // Bound: sessions in the server + claims taken in the last PendingClaimLifetime + SweepEveryInserts.
     readonly Dictionary<string, ClientIdClaim> _claims = new(StringComparer.Ordinal);
+    int _insertsSinceSweep;
+    long _lastSweepTicks = Environment.TickCount64;
     MqttServer? _server;
 
-    sealed record ClientIdClaim(string User, object Token, DateTime CreatedUtc, bool Connected);
+    // CreatedTicks is Environment.TickCount64 (monotonic): a wall-clock step does not age or rejuvenate claims.
+    sealed record ClientIdClaim(string User, ClaimToken Token, long CreatedTicks, bool Connected);
+
+    /// <summary>Identity of one accepted CONNECT; a later CONNECT always has a higher sequence.</summary>
+    sealed class ClaimToken
+    {
+        static long _last;
+        public readonly long Sequence = Interlocked.Increment(ref _last);
+    }
 
     public BrokerHooks(BrokerConfig config, ILogger log, int? maxConcurrentKdf = null, DropCounters? drops = null)
     {
@@ -69,6 +95,9 @@ public sealed class BrokerHooks
     internal DropCounters Drops { get; }
 
     internal Authenticator Authenticator => _authenticator;
+
+    /// <summary>Points session lookups at <paramref name="server"/> without subscribing to its events (for tests).</summary>
+    internal void UseServerForLookups(MqttServer server) => _server = server;
 
     public void Attach(MqttServer server)
     {
@@ -153,30 +182,97 @@ public sealed class BrokerHooks
     /// the id belongs to another user whose session exists (connected or persisted) or whose connect is still in
     /// progress. Same-user takeover is always allowed.
     /// </summary>
-    async Task<object?> TryClaimClientIdAsync(string clientId, string user)
+    async Task<ClaimToken?> TryClaimClientIdAsync(string clientId, string user)
     {
-        var token = new object();
+        var token = new ClaimToken();
         ClientIdClaim? seen;
+        bool sweep;
         lock (_claims)
         {
             if (!_claims.TryGetValue(clientId, out seen) || seen.User == user)
             {
-                _claims[clientId] = new ClientIdClaim(user, token, DateTime.UtcNow, false);
-                return token;
+                sweep = Insert(clientId, new ClientIdClaim(user, token, Environment.TickCount64, false));
+                seen = null;
+            }
+            else
+            {
+                sweep = false;
             }
         }
 
-        // Held by another user: only a dead claim (its session is gone) may be replaced.
-        var alive = await SessionExistsAsync(clientId).ConfigureAwait(false);
+        if (seen is not null)
+        {
+            // Held by another user: only a dead claim (its session is gone) may be replaced.
+            var alive = await SessionExistsAsync(clientId).ConfigureAwait(false);
+            lock (_claims)
+            {
+                if (!_claims.TryGetValue(clientId, out var current) || !ReferenceEquals(current, seen))
+                    return null;   // changed while we looked; the client retries
+                if (alive || (!current.Connected && !IsStale(current, Environment.TickCount64)))
+                    return null;
+                sweep = Insert(clientId, new ClientIdClaim(user, token, Environment.TickCount64, false));
+            }
+        }
+
+        if (sweep)
+        {
+            try
+            {
+                await SweepAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // Housekeeping must not refuse a login; the next sweep will try again.
+                _log.Debug("Claim sweep skipped: {Error}", ex.GetType().Name);
+            }
+        }
+        return token;
+    }
+
+    bool IsStale(ClientIdClaim claim, long now) => now - claim.CreatedTicks >= (long)PendingClaimLifetime.TotalMilliseconds;
+
+    /// <summary>Stores a claim and says whether a sweep is due (see <see cref="SweepEveryInserts"/>). Caller holds the lock.</summary>
+    bool Insert(string clientId, ClientIdClaim claim)
+    {
+        _claims[clientId] = claim;
+        if (++_insertsSinceSweep < SweepEveryInserts && claim.CreatedTicks - _lastSweepTicks < (long)PendingClaimLifetime.TotalMilliseconds)
+            return false;
+        _insertsSinceSweep = 0;
+        _lastSweepTicks = claim.CreatedTicks;
+        return true;
+    }
+
+    /// <summary>
+    /// Removes every claim older than <see cref="PendingClaimLifetime"/> whose client id has no session in the server,
+    /// pending or connected. Younger claims are left alone: they may be in the gap between the connect hook and the
+    /// session being created.
+    /// </summary>
+    async Task SweepAsync()
+    {
+        var sessions = new HashSet<string>(StringComparer.Ordinal);
+        if (_server is not null)
+        {
+            foreach (var session in await _server.GetSessionsAsync().ConfigureAwait(false))
+                sessions.Add(session.Id);
+        }
+        int swept, left;
         lock (_claims)
         {
-            if (!_claims.TryGetValue(clientId, out var current) || !ReferenceEquals(current, seen))
-                return null;   // changed while we looked; the client retries
-            if (alive || (!current.Connected && DateTime.UtcNow - current.CreatedUtc < PendingClaimLifetime))
-                return null;
-            _claims[clientId] = new ClientIdClaim(user, token, DateTime.UtcNow, false);
-            return token;
+            var now = Environment.TickCount64;
+            List<string>? stale = null;
+            foreach (var (id, c) in _claims)
+            {
+                if (IsStale(c, now) && !sessions.Contains(id))
+                    (stale ??= []).Add(id);
+            }
+            if (stale is null)
+                return;
+            foreach (var id in stale)
+                _claims.Remove(id);
+            swept = stale.Count;
+            left = _claims.Count;
         }
+        _log.Debug("Swept {Swept} client id claim(s) without a session; {Claims} reserved", swept, left);
     }
 
     /// <summary>Whether MQTTnet holds a live or persisted, non-expired session for the client id.</summary>
@@ -196,19 +292,39 @@ public sealed class BrokerHooks
         return false;
     }
 
-    async Task OnClientConnectedAsync(ClientConnectedEventArgs args)
+    internal async Task OnClientConnectedAsync(ClientConnectedEventArgs args)
     {
         try
         {
             var owner = args.SessionItems?[OwnerKey] as string;
             if (owner is not null && owner == args.UserName)
             {
-                // The session in use may be an older one (CleanSession=false reuse): track its token.
-                var sessionToken = args.SessionItems![ClaimTokenKey];
+                // Mark the claim connected with the session's token (an older one when a CleanSession=false reconnect
+                // reused the session, so that SessionDeleted can match it later). The claim is (re)written rather than
+                // only updated because a SessionDeleted for this user's previous session may have released the pending
+                // claim while this connect was in flight. A connected claim with a newer token belongs to a later
+                // CONNECT for this id and is left alone: this event runs after the CONNACK, so the client it reports
+                // may already have been taken over.
+                if (args.SessionItems![ClaimTokenKey] is not ClaimToken sessionToken)
+                    return;
                 lock (_claims)
                 {
-                    if (sessionToken is not null && _claims.TryGetValue(args.ClientId, out var claim) && claim.User == owner)
-                        _claims[args.ClientId] = claim with { Token = sessionToken, Connected = true };
+                    if (!_claims.TryGetValue(args.ClientId, out var claim)
+                        || (claim.User == owner && (!claim.Connected || claim.Token.Sequence <= sessionToken.Sequence)))
+                    {
+                        _claims[args.ClientId] = new ClientIdClaim(owner, sessionToken, Environment.TickCount64, true);
+                    }
+                }
+                // The client may also have died already (its session deleted and SessionDeleted fired before the
+                // write above). A claim written after that would have nothing left to release it, so it is taken back
+                // unless the session this connection was attached to is still the server's session for the id.
+                if (!await IsCurrentSessionAsync(args.ClientId, args.SessionItems).ConfigureAwait(false))
+                {
+                    lock (_claims)
+                    {
+                        if (_claims.TryGetValue(args.ClientId, out var claim) && ReferenceEquals(claim.Token, sessionToken))
+                            _claims.Remove(args.ClientId);
+                    }
                 }
                 return;
             }
@@ -229,13 +345,36 @@ public sealed class BrokerHooks
         }
     }
 
-    Task OnSessionDeletedAsync(SessionDeletedEventArgs args)
+    /// <summary>Whether the server's session for the client id is the one holding <paramref name="items"/>.</summary>
+    async Task<bool> IsCurrentSessionAsync(string clientId, System.Collections.IDictionary items)
     {
-        var token = args.SessionItems?[ClaimTokenKey];
+        if (_server is null)
+            return true;
+        foreach (var session in await _server.GetSessionsAsync().ConfigureAwait(false))
+        {
+            if (session.Id == clientId)
+                return ReferenceEquals(session.Items, items);
+        }
+        return false;
+    }
+
+    internal Task OnSessionDeletedAsync(SessionDeletedEventArgs args)
+    {
+        var token = args.SessionItems?[ClaimTokenKey] as ClaimToken;
         lock (_claims)
         {
-            if (args.Id is not null && token is not null && _claims.TryGetValue(args.Id, out var claim) && ReferenceEquals(claim.Token, token))
-                _claims.Remove(args.Id);
+            if (args.Id is null || !_claims.TryGetValue(args.Id, out var claim))
+                return Task.CompletedTask;
+            // Token match: the session the claim tracked. Same-user pending claim: a reconnect of the owner that
+            // reused this session and died before ClientConnected; nothing is left to protect. Same-user connected
+            // claim no newer than the deleted session's connect: its own session was replaced without an event and
+            // the replacement has now gone too. A newer connected same-user claim has a session of its own and stays.
+            var release = ReferenceEquals(claim.Token, token)
+                || (claim.User == args.UserName && (!claim.Connected || (token is not null && claim.Token.Sequence <= token.Sequence)));
+            if (!release)
+                return Task.CompletedTask;
+            _claims.Remove(args.Id);
+            _log.Debug("Client id {ClientId} released by {Username}; {Claims} reserved", Trim(args.Id), Trim(args.UserName), _claims.Count);
         }
         return Task.CompletedTask;
     }
@@ -248,6 +387,13 @@ public sealed class BrokerHooks
             lock (_claims)
                 return _claims.Count;
         }
+    }
+
+    /// <summary>Whether the client id is currently reserved (for tests).</summary>
+    internal bool HasClaim(string clientId)
+    {
+        lock (_claims)
+            return _claims.ContainsKey(clientId);
     }
 
     /// <summary>
