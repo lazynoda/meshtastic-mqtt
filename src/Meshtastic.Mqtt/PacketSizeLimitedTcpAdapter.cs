@@ -149,9 +149,20 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
             if (handler is null)
                 return;
 
-            var channel = new PacketSizeGuardChannel(new MqttTcpChannel(stream, local, remote, null), maxPacketSize,
-                declared => log.Warning("Connection closed: packet length {Length} exceeds limits.max_packet_size {MaxPacketSize} from {RemoteIp}",
-                    declared, maxPacketSize, (remote as IPEndPoint)?.Address.ToString() ?? "unknown"));
+            var remoteIp = (remote as IPEndPoint)?.Address.ToString() ?? "unknown";
+            var channel = new PacketSizeGuardChannel(new MqttTcpChannel(stream, local, remote, null), maxPacketSize, (reason, declared) =>
+            {
+                if (reason == PacketSizeGuardChannel.TripReason.Oversized)
+                {
+                    log.Warning("Connection closed: packet length {Length} exceeds limits.max_packet_size {MaxPacketSize} from {RemoteIp}",
+                        declared, maxPacketSize, remoteIp);
+                }
+                else
+                {
+                    // The partial value is meaningless here (more than 4 length bytes), so it is not logged.
+                    log.Warning("Connection closed: malformed Remaining Length (more than 4 bytes) from {RemoteIp}", remoteIp);
+                }
+            });
             var formatter = new MqttPacketFormatterAdapter(new MqttBufferWriter(options.WriterBufferSize, options.WriterBufferSizeMax));
             using var adapter = new MqttChannelAdapter(channel, formatter, _mqttLogger!);
             adapter.AllowPacketFragmentation = options.DefaultEndpointOptions.AllowPacketFragmentation;
@@ -198,8 +209,17 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
 /// A declared length is rejected as soon as its partial value passes the limit, without waiting for the
 /// remaining length bytes. Once tripped, every later read returns 0 (connection closed).
 /// </remarks>
-public sealed class PacketSizeGuardChannel(IMqttChannel inner, int maxPacketSize, Action<long>? onOversized = null) : IMqttChannel
+public sealed class PacketSizeGuardChannel(IMqttChannel inner, int maxPacketSize, Action<PacketSizeGuardChannel.TripReason, long>? onTripped = null) : IMqttChannel
 {
+    /// <summary>Why the guard ended a connection.</summary>
+    public enum TripReason
+    {
+        /// <summary>The declared Remaining Length (possibly still partial) exceeds the limit; the value is reported.</summary>
+        Oversized,
+        /// <summary>More than four Remaining Length bytes: the value is meaningless and MQTTnet would refuse it too.</summary>
+        Malformed,
+    }
+
     enum State { FixedHeader, RemainingLength, Body }
 
     State _state = State.FixedHeader;
@@ -208,6 +228,9 @@ public sealed class PacketSizeGuardChannel(IMqttChannel inner, int maxPacketSize
     int _lengthBytes;
     long _bodyLeft;
     bool _tripped;
+
+    /// <summary>Set by <see cref="Accept"/> when it returns false.</summary>
+    internal TripReason? LastTrip { get; private set; }
 
     public X509Certificate2 ClientCertificate => inner.ClientCertificate;
     public EndPoint RemoteEndPoint => inner.RemoteEndPoint;
@@ -229,7 +252,7 @@ public sealed class PacketSizeGuardChannel(IMqttChannel inner, int maxPacketSize
         if (read > 0 && !Accept(buffer.AsSpan(offset, read)))
         {
             _tripped = true;
-            onOversized?.Invoke(_length);
+            onTripped?.Invoke(LastTrip ?? TripReason.Oversized, _length);
             return 0;
         }
         return read;
@@ -257,7 +280,10 @@ public sealed class PacketSizeGuardChannel(IMqttChannel inner, int maxPacketSize
                     _length += (b & 0x7F) * _multiplier;
                     _multiplier *= 128;
                     if (_length > maxPacketSize)
+                    {
+                        LastTrip = TripReason.Oversized;
                         return false;
+                    }
                     if ((b & 0x80) == 0)
                     {
                         _bodyLeft = _length;
@@ -265,7 +291,8 @@ public sealed class PacketSizeGuardChannel(IMqttChannel inner, int maxPacketSize
                     }
                     else if (_lengthBytes == 4)
                     {
-                        return false;   // more than 4 length bytes: malformed, MQTTnet would refuse it too
+                        LastTrip = TripReason.Malformed;   // a fifth length byte would follow; MQTTnet would refuse it too
+                        return false;
                     }
                     break;
 

@@ -125,6 +125,19 @@ public sealed class PacketSizeLimitTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task MalformedRemainingLength_IsLoggedAsMalformed_NotAsLengthZero()
+    {
+        // Review nit n1: five length bytes used to log "packet length 0 exceeds limits.max_packet_size".
+        using var s = await Open();
+        await s.SendAsync(new byte[] { 0x10, 0x80, 0x80, 0x80, 0x80 }, SocketFlags.None, Ct);
+        Assert.True(await ClosedByServer(s, 5), "a malformed Remaining Length must close the connection");
+        Assert.True(await WaitUntil(() => _logs.Events.Any(e => e.RenderMessage().Contains("Connection closed"))));
+        var line = Assert.Single(_logs.Events, e => e.RenderMessage().Contains("Connection closed"));
+        Assert.Contains("malformed Remaining Length", line.RenderMessage());
+        Assert.DoesNotContain("exceeds", line.RenderMessage());
+    }
+
+    [Fact]
     public async Task PacketJustUnderTheLimit_StillPasses()
     {
         // A PUBLISH whose Remaining Length is exactly 4096 (2 + topic + 2 packet id + payload) is accepted.

@@ -51,8 +51,32 @@ public class PacketSizeGuardTests
     }
 
     [Fact]
-    public void FiveLengthBytes_AreMalformed() =>
-        Assert.False(Guard(int.MaxValue).Accept(new byte[] { 0x10, 0x80, 0x80, 0x80, 0x80, 0x01 }));
+    public void FiveLengthBytes_AreMalformed()
+    {
+        var guard = Guard(int.MaxValue);
+        Assert.False(guard.Accept(new byte[] { 0x10, 0x80, 0x80, 0x80, 0x80, 0x01 }));
+        Assert.Equal(PacketSizeGuardChannel.TripReason.Malformed, guard.LastTrip);
+    }
+
+    [Fact]
+    public void OversizedLength_IsReportedAsOversized()
+    {
+        var guard = Guard();
+        Assert.False(guard.Accept(Header(0x30, 4097)));
+        Assert.Equal(PacketSizeGuardChannel.TripReason.Oversized, guard.LastTrip);
+    }
+
+    [Fact]
+    public async Task ReadAsync_ReportsMalformedLength_WithoutAValue()
+    {
+        // Review nit n1: five length bytes used to be reported as "packet length 0 exceeds the limit".
+        var inner = new NullChannel(new byte[] { 0x10, 0x80, 0x80, 0x80, 0x80 });
+        PacketSizeGuardChannel.TripReason? reason = null;
+        var guard = new PacketSizeGuardChannel(inner, 4096, (r, _) => reason = r);
+        var buffer = new byte[8];
+        Assert.Equal(0, await guard.ReadAsync(buffer, 0, 8, TestContext.Current.CancellationToken));
+        Assert.Equal(PacketSizeGuardChannel.TripReason.Malformed, reason);
+    }
 
     [Fact]
     public void Framing_SurvivesArbitraryReadSplits()
@@ -85,7 +109,7 @@ public class PacketSizeGuardTests
         // MQTTnet reads 2 bytes (type + first length byte), then the length one byte at a time.
         var inner = new NullChannel(new byte[] { 0x10, 0xFF, 0xFF, 0xFF, 0x7F });
         long? reported = null;
-        var guard = new PacketSizeGuardChannel(inner, 4096, n => reported = n);
+        var guard = new PacketSizeGuardChannel(inner, 4096, (_, n) => reported = n);
         var buffer = new byte[2];
         var ct = TestContext.Current.CancellationToken;
         Assert.Equal(2, await guard.ReadAsync(buffer, 0, 2, ct));   // 0x10 0xFF: 127 so far, under the limit
