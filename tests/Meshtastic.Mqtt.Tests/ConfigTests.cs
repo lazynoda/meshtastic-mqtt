@@ -51,6 +51,7 @@ public class ConfigTests
         Assert.Equal(10, c.Limits.CommunicationTimeoutSeconds);
         Assert.Equal(3, c.Limits.AuthQueueTimeoutSeconds);
         Assert.Equal(64, c.Limits.AuthMaxPending);
+        Assert.Equal(4, c.Limits.AuthMaxPendingPerUser);
     }
 
     [Fact]
@@ -139,11 +140,12 @@ public class ConfigTests
         Assert.Equal(3, d.AuthQueueTimeoutSeconds);
         Assert.Equal(64, d.AuthMaxPending);
 
-        var c = ConfigLoader.Parse(Minimal("limits:\n  max_packet_size: 2048\n  communication_timeout_seconds: 5\n  auth_queue_timeout_seconds: 2\n  auth_max_pending: 8")).Limits!;
+        var c = ConfigLoader.Parse(Minimal("limits:\n  max_packet_size: 2048\n  communication_timeout_seconds: 5\n  auth_queue_timeout_seconds: 2\n  auth_max_pending: 8\n  auth_max_pending_per_user: 2")).Limits!;
         Assert.Equal(2048, c.MaxPacketSize);
         Assert.Equal(5, c.CommunicationTimeoutSeconds);
         Assert.Equal(2, c.AuthQueueTimeoutSeconds);
         Assert.Equal(8, c.AuthMaxPending);
+        Assert.Equal(2, c.AuthMaxPendingPerUser);
     }
 
     [Theory]
@@ -153,6 +155,7 @@ public class ConfigTests
     [InlineData("limits:\n  communication_timeout_seconds: 0", "limits.communication_timeout_seconds")]
     [InlineData("limits:\n  auth_queue_timeout_seconds: 0", "limits.auth_queue_timeout_seconds")]
     [InlineData("limits:\n  auth_max_pending: 0", "limits.auth_max_pending")]
+    [InlineData("limits:\n  auth_max_pending_per_user: 0", "limits.auth_max_pending_per_user")]
     [InlineData("limits:", "limits")]
     [InlineData("limits:\n  max_packet: 4096", "max_packet")]
     public void InvalidLimits_AreRejected(string extra, string mentions)

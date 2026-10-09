@@ -170,6 +170,7 @@ public sealed class LimitsConfig
     public const int DefaultCommunicationTimeoutSeconds = 10;
     public const int DefaultAuthQueueTimeoutSeconds = 3;
     public const int DefaultAuthMaxPending = 64;
+    public const int DefaultAuthMaxPendingPerUser = 4;
 
     /// <summary>
     /// Largest MQTT packet accepted, counted as the fixed header's Remaining Length. Enforced while the header is
@@ -186,12 +187,19 @@ public sealed class LimitsConfig
     /// <summary>Logins that may run or wait for password hashing at once, per lane; the rest get "server unavailable".</summary>
     public int? AuthMaxPending { get; set; } = DefaultAuthMaxPending;
 
+    /// <summary>
+    /// Distinct (username, password) checks one configured username may have pending at once; the rest get
+    /// "server unavailable". Keeps one username's wrong passwords from filling the queue for every other user.
+    /// </summary>
+    public int? AuthMaxPendingPerUser { get; set; } = DefaultAuthMaxPendingPerUser;
+
     internal void Validate(List<string> errors)
     {
         Check(errors, "max_packet_size", MaxPacketSize, MinMaxPacketSize, MaxMaxPacketSize);
         Check(errors, "communication_timeout_seconds", CommunicationTimeoutSeconds, 1, 300);
         Check(errors, "auth_queue_timeout_seconds", AuthQueueTimeoutSeconds, 1, 60);
         Check(errors, "auth_max_pending", AuthMaxPending, 1, 100_000);
+        Check(errors, "auth_max_pending_per_user", AuthMaxPendingPerUser, 1, 100_000);
     }
 
     static void Check(List<string> errors, string key, int? value, int min, int max)

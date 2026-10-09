@@ -92,7 +92,8 @@ Start from [`config.example.yaml`](config.example.yaml).
 | `limits.max_packet_size` | `4096` | Largest MQTT packet accepted, in bytes (Remaining Length). Checked before the packet is allocated; a larger one closes the connection. Range 512-1048576. |
 | `limits.communication_timeout_seconds` | `10` | How long a new connection may take to send CONNECT, and a write may stall (MQTTnet's default is 100). |
 | `limits.auth_queue_timeout_seconds` | `3` | How long a login may wait for a password-hashing slot before it is answered "server busy". |
-| `limits.auth_max_pending` | `64` | Logins that may run or wait for password hashing at once (separately for configured users and for unknown usernames). Further logins get "server busy" without hashing. |
+| `limits.auth_max_pending` | `64` | Distinct password checks that may run or wait at once (separately for configured users and for unknown usernames). Further logins get "server busy" without hashing. Range 1-100000. |
+| `limits.auth_max_pending_per_user` | `4` | Distinct password checks one configured username may have pending at once; the rest get "server busy". Usernames are served in turn. Range 1-100000. |
 
 ### Limits
 
@@ -106,9 +107,16 @@ the check runs in the broker's own TCP listener, on the raw bytes.
 Logins pay PBKDF2 only when the password is not already known (see below). Those checks run in two
 queues, one for configured usernames and one for unknown usernames, each bounded by `auth_max_pending`
 and `auth_queue_timeout_seconds`, so a flood of bad logins can neither grow memory without bound nor keep
-legitimate users waiting. Simultaneous logins with the same username and password (a fleet of `meshdev`
-nodes reconnecting after a broker restart) share one PBKDF2 computation, and the check with the most logins
-waiting on it runs first, so the real `meshdev` password jumps ahead of an attacker's one-off guesses.
+legitimate users waiting. Within the configured-users queue, checks are grouped by username and the usernames
+are served in turn (round-robin), and one username may have at most `auth_max_pending_per_user` distinct
+checks pending; beyond that its logins get "server busy" at once. Wrong passwords for the public `meshdev`
+user therefore delay another user's cold login by at most one check, however many guesses arrive and however
+many times each guess is sent. Simultaneous logins with the same username and password (a fleet of `meshdev`
+nodes reconnecting after a broker restart) share one PBKDF2 computation, and within a username the check with
+the most logins waiting on it runs first, so the real `meshdev` password jumps ahead of an attacker's guesses.
+What the queue cannot do is tell a lone cold `meshdev` login from a guess before hashing it: while `meshdev`'s
+own checks are all taken by guesses, that login is told "server busy" and retries. Limiting such a flood is a
+per-IP job (a later phase).
 
 ### Logs
 

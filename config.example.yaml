@@ -45,9 +45,12 @@ limits:
   # A login waits at most this long (seconds) for a password-hashing slot; then it gets "server unavailable"
   # and the client retries later. Logins that match an already verified password do not wait.
   auth_queue_timeout_seconds: 3
-  # Logins that may run or wait for password hashing at once (configured users and unknown usernames have
+  # Distinct password checks that may run or wait at once (configured users and unknown usernames have
   # separate queues of this size). Further logins get "server unavailable" without hashing anything.
   auth_max_pending: 64
+  # Distinct password checks one configured username may have pending at once; usernames are served in turn,
+  # so wrong passwords for the public meshdev user cannot fill the queue or delay another user's login.
+  auth_max_pending_per_user: 4
 
 users:
   # Firmware default credentials (meshdev / large4cats). Public by design, so uplink only:

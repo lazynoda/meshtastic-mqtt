@@ -61,10 +61,10 @@ public class AuthTests
         Assert.Equal(AuthResult.Failed, await auth.AuthenticateAsync("meshdev", null, TestContext.Current.CancellationToken));
     }
 
-    static Authenticator Build(int slots, TimeSpan timeout, int maxPending)
+    static Authenticator Build(int slots, TimeSpan timeout, int maxPending, int? maxPendingPerUser = null)
     {
         var config = ConfigLoader.Parse($"users:\n  - username: meshdev\n    password_hash: \"{MeshdevHash}\"\n");
-        return new Authenticator(config.Users!, slots, timeout, maxPending);
+        return new Authenticator(config.Users!, slots, timeout, maxPending, maxPendingPerUser);
     }
 
     [Fact]
@@ -130,7 +130,7 @@ public class AuthTests
     {
         // 10 different wrong passwords for meshdev are queued first, then 10 nodes log in with the real one.
         // The real password has 10 waiters, each guess has 1: it runs right after the check already started.
-        var auth = Build(slots: 1, TimeSpan.FromSeconds(30), maxPending: 64);
+        var auth = Build(slots: 1, TimeSpan.FromSeconds(30), maxPending: 64, maxPendingPerUser: 64);
         var ct = TestContext.Current.CancellationToken;
         var guesses = Enumerable.Range(0, 10).Select(i => auth.AuthenticateAsync("meshdev", Pw($"guess-{i}"), ct)).ToArray();
         var nodes = Enumerable.Range(0, 10).Select(_ => auth.AuthenticateAsync("meshdev", Pw("large4cats"), ct)).ToArray();
@@ -140,6 +140,46 @@ public class AuthTests
         Assert.All(results, r => Assert.Equal(AuthResult.Success, r));
         // Only the guess that had already started may finish before the real password is served.
         Assert.True(guessesDoneFirst <= 1, $"the real password waited for {guessesDoneFirst} guesses");
+        Assert.All(await Task.WhenAll(guesses), r => Assert.Equal(AuthResult.Failed, r));
+    }
+
+    [Fact]
+    public async Task OneUsersWrongPasswords_CannotFillTheQueue_ForAnotherUser()
+    {
+        // Review finding 1 (round 2): 40 distinct wrong passwords for meshdev, each sent twice, 1 slot. meshdev may
+        // hold at most the per-user cap (4) of pending checks, the rest are Busy at once instead of queued, and
+        // alice's cold login is served round-robin: behind the check already running and at most one more.
+        var config = ConfigLoader.Parse($"users:\n  - username: meshdev\n    password_hash: \"{MeshdevHash}\"\n  - username: alice\n    password_hash: \"{AliceHash}\"\n");
+        var auth = new Authenticator(config.Users!, 1, TimeSpan.FromSeconds(30), 64);
+        var ct = TestContext.Current.CancellationToken;
+        var guesses = Enumerable.Range(0, 40)
+            .SelectMany(i => new[] { auth.AuthenticateAsync("meshdev", Pw($"guess-{i}"), ct), auth.AuthenticateAsync("meshdev", Pw($"guess-{i}"), ct) })
+            .ToArray();
+
+        var alice = auth.AuthenticateAsync("alice", Pw("correct-horse"), ct);
+        Assert.Equal(AuthResult.Success, await alice);
+        var guessesDoneFirst = guesses.Count(t => t.IsCompleted && t.Result == AuthResult.Failed);
+        Assert.True(guessesDoneFirst <= 2 * 2, $"alice waited for {guessesDoneFirst / 2} meshdev checks");
+
+        var results = await Task.WhenAll(guesses);
+        Assert.DoesNotContain(AuthResult.Success, results);
+        Assert.Equal(2 * 4, results.Count(r => r == AuthResult.Failed));   // the capped checks ran, two waiters each
+        Assert.Equal(2 * 36, results.Count(r => r == AuthResult.Busy));
+        Assert.Equal(5, auth.KdfRuns);   // 4 meshdev guesses + alice
+    }
+
+    [Fact]
+    public async Task ColdMeshdevLogin_BehindItsOwnWrongPasswords_IsServedByWaiterCount()
+    {
+        // Inside one username the most-awaited check still wins: a 10-node reconnect storm beats guesses with 2 waiters.
+        var auth = Build(slots: 1, TimeSpan.FromSeconds(30), maxPending: 64);
+        var ct = TestContext.Current.CancellationToken;
+        var guesses = Enumerable.Range(0, 3)
+            .SelectMany(i => new[] { auth.AuthenticateAsync("meshdev", Pw($"guess-{i}"), ct), auth.AuthenticateAsync("meshdev", Pw($"guess-{i}"), ct) })
+            .ToArray();
+        var nodes = Enumerable.Range(0, 10).Select(_ => auth.AuthenticateAsync("meshdev", Pw("large4cats"), ct)).ToArray();
+        Assert.All(await Task.WhenAll(nodes), r => Assert.Equal(AuthResult.Success, r));
+        Assert.True(guesses.Count(t => t.IsCompleted) <= 2, "only the guess already running may finish before the storm");
         Assert.All(await Task.WhenAll(guesses), r => Assert.Equal(AuthResult.Failed, r));
     }
 

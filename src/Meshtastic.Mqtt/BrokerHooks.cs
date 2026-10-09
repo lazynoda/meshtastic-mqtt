@@ -58,7 +58,8 @@ public sealed class BrokerHooks
         var limits = config.Limits ?? new LimitsConfig();
         _authenticator = new Authenticator(users, maxConcurrentKdf,
             TimeSpan.FromSeconds(limits.AuthQueueTimeoutSeconds ?? LimitsConfig.DefaultAuthQueueTimeoutSeconds),
-            limits.AuthMaxPending ?? LimitsConfig.DefaultAuthMaxPending);
+            limits.AuthMaxPending ?? LimitsConfig.DefaultAuthMaxPending,
+            limits.AuthMaxPendingPerUser ?? LimitsConfig.DefaultAuthMaxPendingPerUser);
         _inspector = new PacketInspector(config);
         Drops = drops ?? new DropCounters(log, start: false);
         foreach (var user in users)
