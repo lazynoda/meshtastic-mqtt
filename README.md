@@ -17,6 +17,8 @@ exposed on the internet:
   map reports only after checking they are real `MapReport`s.
 - **Limits and dedupe**: per-IP connection cap and connect rate, a publish payload cap, a per-client publish
   rate, a cross-gateway dedupe and a per-node packet rate (see [Limits and dedupe](#limits-and-dedupe)).
+- **Auth bans**: an address that fails to log in too often is banned for a while, inside the broker itself
+  (no system fail2ban, no nftables, no host changes) (see [Auth bans](#auth-bans)).
 - **No message content in logs**, ever. Logs carry topic, client id, `from`, packet id and portnum.
 - Plain MQTT on port 1883. No TLS in this version.
 
@@ -24,7 +26,7 @@ exposed on the internet:
 
 | Hook | Rule |
 |---|---|
-| Connect | Username and password are checked against `users`. Unknown user or wrong password → `BadUserNameOrPassword` (MQTT 3.1.1 return code 4), logged with username and remote IP, never the password. A reconnect with an existing client id takes over the old session, but only for the **same user**: a client id held by a live or persisted session of another user is refused with `ClientIdentifierNotValid` (3.1.1 return code 2) and the session owner stays connected. The id is free again once that session is gone. If the password-check queue is full (see `limits`), the client gets `ServerBusy` (3.1.1 return code 3, "server unavailable") and retries. |
+| Connect | Username and password are checked against `users`. Unknown user or wrong password → `BadUserNameOrPassword` (MQTT 3.1.1 return code 4), logged with username and remote IP, never the password. A reconnect with an existing client id takes over the old session, but only for the **same user**: a client id held by a live or persisted session of another user is refused with `ClientIdentifierNotValid` (3.1.1 return code 2) and the session owner stays connected. The id is free again once that session is gone. If the password-check queue is full (see `limits`), the client gets `ServerBusy` (3.1.1 return code 3, "server unavailable") and retries. An address that failed too many logins is banned: the socket is closed at the accept, and a CONNECT that arrives after the ban is refused with `Banned` (0x8A) before the password is checked (see [Auth bans](#auth-bans)). |
 | Subscribe | The requested filter is granted only if **every** topic it can match is covered by the `subscribe_allow` filters of the user that **created the session** (bound at connect time, so a reused session never changes hands). Real MQTT wildcard semantics, not prefix matching. An empty or missing list denies everything. `#` and `+` never grant `$`-topics such as `$SYS/#`. Refusal → MQTT 5 reason `Not authorized` (135); on MQTT 3.1.1 → `0x80`. |
 | Publish | First the publish ACL (below), then the limits and the packet filter (below). A refused publish is dropped, never forwarded, and the client stays connected. Accepted messages are re-published with `retain` cleared (firmware never retains), so nothing enters the retained-message store. |
 
@@ -163,6 +165,10 @@ Start from [`config.example.yaml`](config.example.yaml).
 | `limits.dedupe_max_entries` | `200000` | How many packets are remembered for the dedupe at once; the oldest are evicted when the cap is hit. Range 1-10000000. |
 | `limits.packet_rate_per_from_per_minute` | `30` | Packets one node (the packet's `from`) may send per minute (token bucket, with the burst below). A packet is charged once, on its first copy. `0` turns the rate off. Range 0-1000000. |
 | `limits.packet_burst_per_from` | `15` | Burst of the per-node packet rate: how many packets one node may send at once. `0` turns the rate off. Range 0-1000000. |
+| `limits.auth_fail_max_per_ip` | `10` | Failed logins one IP address may make before it is banned. Only a wrong password (or an unknown user, or an unsupported authentication method) counts. `0` turns the bans off. Range 0-100000. |
+| `limits.auth_fail_window_seconds` | `600` | How long the failed logins of one IP address are counted. The window starts with the first failure; when it has passed, the next failure starts a new one. Range 10-86400. |
+| `limits.auth_ban_seconds` | `3600` | How long a banned IP address is refused. The bans live in memory: a restart forgets them. Range 60-604800. |
+| `limits.auth_ban_exempt` | empty | IP ranges (CIDR, IPv4 or IPv6) whose failed logins are never counted and which are never banned. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) matches the IPv4 ranges. |
 
 ### Limits
 
@@ -253,8 +259,51 @@ without bound.
 - **Clients behind one address share the limits.** A CGNAT, a VPN or a tunnel puts many nodes behind one
   IP address: they share the connection cap and the connect rate, and the fleet may be cut. Tune those
   values (or set them to `0`) for the networks the real nodes use.
-- **Distributed floods are not covered here.** One address per flood is bounded; a flood from many addresses
-  is not. That is the job of fail2ban-style bans (phase 4).
+- **Distributed floods are not covered here.** One address per flood is bounded (the per-IP limits above
+  and the [auth bans](#auth-bans) below); a flood from many addresses is not. That needs an upstream
+  firewall (or a rate limit at the edge) in front of the broker.
+
+### Auth bans
+
+An address that fails to log in too often is banned for a while. The ban lives **inside the broker**: no
+system fail2ban, no nftables, no changes to the host.
+
+- Only a **failed password check** counts: a wrong password, an unknown user or an unsupported
+  authentication method. A full password queue ("server busy"), a client-id conflict, a connection
+  refused at the accept and a connection refused because the address is already banned are not password
+  failures and are not counted.
+- The failures of one address are counted in a window: `auth_fail_max_per_ip` (10) failures within
+  `auth_fail_window_seconds` (600) since the first failure of the window. When the window has passed, the
+  next failure starts a new one. **A successful login does not reset the counter**: with the public
+  `meshdev` credentials an attacker could interleave a correct login between the guesses, and the honest
+  nodes behind the same address would keep the guesses alive.
+- The `auth_fail_max_per_ip`-th failure bans the address for `auth_ban_seconds` (3600) and clears its
+  counter. There is no escalation: every ban lasts the same.
+- A banned address is refused **at the accept**, before a single MQTT byte is read and before it takes a
+  slot or a token of the per-IP limits, and **at the CONNECT**, before the password is checked: the answer
+  is reason code `Banned` (0x8A) on MQTT 5. The second refusal is the one that matters for a client that
+  was already connected when the ban started.
+- The sessions that were already connected are **left alone**: behind a CGNAT or a VPN many honest nodes
+  share one address, and cutting them would cost more than the attack is worth.
+- `auth_ban_exempt` is a list of CIDR ranges (IPv4 and IPv6) whose failures are never counted and which
+  are never banned. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) matches the IPv4 ranges.
+- The bans are in memory: **a restart forgets them**. There is no manual unban.
+
+The tables behind it are bounded (100000 addresses each): the failed logins are evicted oldest first, the
+bans evict the one that ends soonest, and the evictions are counted in the periodic summary.
+
+#### Residual risks
+
+- **The ban is per IP address.** A flood from many addresses is not covered by the broker: the per-IP
+  limits bound one address at a time, and a flood that rotates addresses needs an upstream firewall in
+  front of the broker.
+- **Behind a CGNAT or a VPN many nodes share one address.** One misconfigured node (a wrong password in a
+  loop, a firmware that sends a stale one) can get the whole address banned, and with it the honest nodes
+  behind it. Use `auth_ban_exempt` for those networks, or raise `auth_fail_max_per_ip`.
+- **An IPv6 attacker can rotate addresses inside a /64.** The broker keys the ban by the address, not by
+  the /64, so a client with a whole prefix can walk through it.
+- **The bans are lost on a restart.** A broker that restarts often (a crash loop) hands the attacker a
+  fresh start.
 
 ### Logs
 
@@ -264,6 +313,9 @@ Logs never contain passwords or message payloads. At the default `information` l
 - Failed logins: Warning, one line per attempt with username and remote IP (the format fail2ban will
   read): `Authentication failed for user {Username} from {RemoteIp} (client {ClientId})`. Refused
   authentication methods, client-id conflicts and "server busy" refusals are also Warning with username and IP.
+- A ban is one Warning when it starts: `Banned {RemoteIp} for {Seconds} s after {Failures} authentication
+  failures`. The connections of a banned address are Debug (one per connection) and are counted in the
+  summary as `banned IP`.
 - A refused SUBSCRIBE: one Warning per packet (count of refused filters and the first one), however many
   filters it carries.
 - Dropped publishes: one Information line every 60 s with the number of drops per reason, only when
@@ -275,7 +327,8 @@ Logs never contain passwords or message payloads. At the default `information` l
   `too many connection attempts from one IP`). Each dropped packet is logged individually only at `debug`.
 - Evictions from the bounded tables are counted in the same summary, one reason per table:
   `evicted: dedupe table full`, `evicted: per-node rate table full`, `evicted: per-client rate table full`,
-  `evicted: per-IP connection table full` and `evicted: per-IP rate table full`. A non-zero count means a
+  `evicted: per-IP connection table full`, `evicted: per-IP rate table full`,
+  `evicted: auth failure table full` and `evicted: auth ban table full`. A non-zero count means a
   cap was reached (a flood of forged ids, most likely) and the oldest entries of that table were dropped.
 
 `debug` also logs every accepted packet (topic, client, `from`, packet id, portnum).
@@ -361,17 +414,18 @@ Test fixtures (`tests/Meshtastic.Mqtt.Tests/Fixtures/*.bin`) are real-format env
 
 ## Not in this version
 
-Fail2ban-style bans and TLS. See the "Ideas" list below for where this is heading. The rate limits per
-IP, per client and per node, the cross-gateway dedupe and the publish payload cap are in
-[Limits and dedupe](#limits-and-dedupe); the payload cap acts in the publish hook, after the ACL, because
-the packet has already been read by then (the `max_packet_size` check is the one that acts while the packet
-is being read).
+TLS. The fail2ban-style bans are in this version, inside the broker (see [Auth bans](#auth-bans)): no
+system fail2ban, no nftables. The rate limits per IP, per client and per node, the cross-gateway dedupe
+and the publish payload cap are in [Limits and dedupe](#limits-and-dedupe); the payload cap acts in the
+publish hook, after the ACL, because the packet has already been read by then (the `max_packet_size`
+check is the one that acts while the packet is being read).
 
 ## Ideas for MQTT mesh moderation
 
 - "Zero hopping" certain packets
 - Blocking or rate-limiting certain portnums
-- Fail2ban style connection moderation
+- Fail2ban style connection moderation (per-IP bans are in this version; a ban list shared between
+  brokers is not)
 - Banning from known bad actors list
 
 ## License
