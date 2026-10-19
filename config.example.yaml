@@ -51,6 +51,36 @@ limits:
   # Distinct password checks one configured username may have pending at once; usernames are served in turn,
   # so wrong passwords for the public meshdev user cannot fill the queue or delay another user's login.
   auth_max_pending_per_user: 4
+  # Connections one IP address may hold open at once. Enforced when the connection is accepted, before any
+  # MQTT byte is read: over the cap the socket is closed at once. 0 turns the cap off. Every client behind
+  # one NAT, one CGNAT or one VPN shares an address: raise it or turn it off for those.
+  max_connections_per_ip: 16
+  # Connections one IP address may open per minute (a token bucket, with the burst below). Enforced on
+  # accept, so it bounds a flood of CONNECTs and password guesses from a single address. 0 turns it off.
+  connect_rate_per_ip_per_minute: 30
+  # Burst of the connect rate: how many connections one address may open at once. 0 turns the rate off.
+  connect_burst_per_ip: 10
+  # Largest publish payload accepted, in bytes. Checked in the publish hook, after the publish ACL and
+  # before the packet is parsed. A firmware envelope is a few hundred bytes at most. Cannot be larger than
+  # max_packet_size. Range 64-max_packet_size.
+  max_payload_size: 512
+  # Publishes one client may send per minute (a token bucket, with the burst below). The key is the user
+  # that owns the session plus the client id; the budget dies with the session. 0 turns the rate off.
+  publish_rate_per_client_per_minute: 120
+  # Burst of the per-client publish rate: how many publishes one client may send at once. 0 turns it off.
+  publish_burst_per_client: 60
+  # How long a packet is remembered for the cross-gateway dedupe, in seconds. 0 turns the dedupe off.
+  dedupe_window_seconds: 120
+  # How many gateways may send the same packet before the further copies are dropped. One copy per gateway
+  # is kept on purpose: the dashboards show who heard a packet and at what SNR.
+  dedupe_max_gateways_per_packet: 32
+  # How many packets are remembered for the dedupe at once; the oldest are evicted when the cap is hit.
+  dedupe_max_entries: 200000
+  # Packets one node (the packet's `from`) may send per minute (a token bucket, with the burst below).
+  # A packet is charged once, on its first copy, never once per gateway. 0 turns the rate off.
+  packet_rate_per_from_per_minute: 30
+  # Burst of the per-node packet rate: how many packets one node may send at once. 0 turns it off.
+  packet_burst_per_from: 15
 
 users:
   # Firmware default credentials (meshdev / large4cats). Public by design, so uplink only:

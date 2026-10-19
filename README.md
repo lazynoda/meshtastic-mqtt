@@ -15,6 +15,8 @@ exposed on the internet:
 - **Publish ACL**: a user may publish only to topics matching its `publish_allow`. Empty or missing = no publish.
 - **Packet filtering on publish**: drops empty, malformed, plaintext and undecryptable packets; lets through
   map reports only after checking they are real `MapReport`s.
+- **Limits and dedupe**: per-IP connection cap and connect rate, a publish payload cap, a per-client publish
+  rate, a cross-gateway dedupe and a per-node packet rate (see [Limits and dedupe](#limits-and-dedupe)).
 - **No message content in logs**, ever. Logs carry topic, client id, `from`, packet id and portnum.
 - Plain MQTT on port 1883. No TLS in this version.
 
@@ -24,7 +26,7 @@ exposed on the internet:
 |---|---|
 | Connect | Username and password are checked against `users`. Unknown user or wrong password → `BadUserNameOrPassword` (MQTT 3.1.1 return code 4), logged with username and remote IP, never the password. A reconnect with an existing client id takes over the old session, but only for the **same user**: a client id held by a live or persisted session of another user is refused with `ClientIdentifierNotValid` (3.1.1 return code 2) and the session owner stays connected. The id is free again once that session is gone. If the password-check queue is full (see `limits`), the client gets `ServerBusy` (3.1.1 return code 3, "server unavailable") and retries. |
 | Subscribe | The requested filter is granted only if **every** topic it can match is covered by the `subscribe_allow` filters of the user that **created the session** (bound at connect time, so a reused session never changes hands). Real MQTT wildcard semantics, not prefix matching. An empty or missing list denies everything. `#` and `+` never grant `$`-topics such as `$SYS/#`. Refusal → MQTT 5 reason `Not authorized` (135); on MQTT 3.1.1 → `0x80`. |
-| Publish | First the publish ACL (below), then the packet filter (below). A refused publish is dropped, never forwarded, and the client stays connected. Accepted messages are re-published with `retain` cleared (firmware never retains), so nothing enters the retained-message store. |
+| Publish | First the publish ACL (below), then the limits and the packet filter (below). A refused publish is dropped, never forwarded, and the client stays connected. Accepted messages are re-published with `retain` cleared (firmware never retains), so nothing enters the retained-message store. |
 
 Before any of this, every packet's declared length is checked against `limits.max_packet_size` while its
 fixed header is still being read; a larger one closes the connection before the broker allocates it
@@ -67,16 +69,19 @@ channel packet for which all of these hold:
    `/2/json/` and anything else is dropped, and so is any `/2/map...` topic other than the exact map-report topic.
 2. The payload is a valid `ServiceEnvelope` with a `packet`, `channel_id` and `gateway_id`.
 3. `channel_id` equals the `<channel>` segment of the topic (exact match).
-4. The packet has non-zero `from` and `id` and carries an `encrypted` payload of 1-256 bytes
+4. The `<gateway>` segment of the topic equals the `gateway_id` of the envelope, and it is `!` followed by
+   8 lowercase hex digits (the firmware's `NodeDB::getNodeId()`, the same string in the topic and in the
+   envelope).
+5. The packet has non-zero `from` and `id` and carries an `encrypted` payload of 1-256 bytes
    (plaintext `decoded` packets are dropped).
-5. Channel packets: the key is looked up **by channel name** (`channels`, falling back to `default_psk`).
+6. Channel packets: the key is looked up **by channel name** (`channels`, falling back to `default_psk`).
    The lookup is case-sensitive, like the firmware: the channel hash covers the exact name, so `Test` and
    `test` are different channels and a `test` channel not listed under `channels` uses `default_psk`.
    The packet is decrypted with AES-CTR exactly as the firmware does; it counts as decryptable when the
    result parses as `Data` with a portnum other than `UNKNOWN_APP` (the firmware's own test in
    `Router.cpp perhapsDecode()`). Keys are never tried one after another.
    Undecryptable packets are dropped when `drop_undecryptable: true` (default).
-6. PKI direct messages: see below.
+7. PKI direct messages: see below.
 
 The firmware's channel hash (`MeshPacket.channel`) is also computed for the configured key. A mismatch
 is logged at `debug` level only; it never causes a drop.
@@ -147,6 +152,17 @@ Start from [`config.example.yaml`](config.example.yaml).
 | `limits.auth_queue_timeout_seconds` | `3` | How long a login may wait for a password-hashing slot before it is answered "server busy". |
 | `limits.auth_max_pending` | `64` | Distinct password checks that may run or wait at once (separately for configured users and for unknown usernames). Further logins get "server busy" without hashing. Range 1-100000. |
 | `limits.auth_max_pending_per_user` | `4` | Distinct password checks one configured username may have pending at once; the rest get "server busy". Usernames are served in turn. Range 1-100000. |
+| `limits.max_connections_per_ip` | `16` | Connections one IP address may hold open at once. Applied when the connection is accepted, before any MQTT byte is read; over the cap the socket is closed at once. `0` turns the cap off. Range 0-100000. |
+| `limits.connect_rate_per_ip_per_minute` | `30` | Connections one IP address may open per minute (token bucket, with the burst below). Applied on accept, so it bounds a flood of CONNECTs and password guesses from one address. `0` turns the rate off. Range 0-1000000. |
+| `limits.connect_burst_per_ip` | `10` | Burst of the per-IP connect rate: how many connections one address may open at once. `0` turns the rate off. Range 0-1000000. |
+| `limits.max_payload_size` | `512` | Largest publish payload accepted, in bytes. Checked in the publish hook, after the publish ACL and before the packet is parsed. Range 64-`max_packet_size`. |
+| `limits.publish_rate_per_client_per_minute` | `120` | Publishes one client may send per minute (token bucket, with the burst below). The key is the user that owns the session plus the client id. `0` turns the rate off. Range 0-1000000. |
+| `limits.publish_burst_per_client` | `60` | Burst of the per-client publish rate: how many publishes one client may send at once. `0` turns the rate off. Range 0-1000000. |
+| `limits.dedupe_window_seconds` | `120` | How long a packet is remembered for the cross-gateway dedupe. `0` turns the dedupe off. Range 0-86400. |
+| `limits.dedupe_max_gateways_per_packet` | `32` | How many gateways may send the same packet before the further copies are dropped. One copy per gateway is kept. Range 1-100000. |
+| `limits.dedupe_max_entries` | `200000` | How many packets are remembered for the dedupe at once; the oldest are evicted when the cap is hit. Range 1-10000000. |
+| `limits.packet_rate_per_from_per_minute` | `30` | Packets one node (the packet's `from`) may send per minute (token bucket, with the burst below). A packet is charged once, on its first copy. `0` turns the rate off. Range 0-1000000. |
+| `limits.packet_burst_per_from` | `15` | Burst of the per-node packet rate: how many packets one node may send at once. `0` turns the rate off. Range 0-1000000. |
 
 ### Limits
 
@@ -169,7 +185,76 @@ nodes reconnecting after a broker restart) share one PBKDF2 computation, and wit
 the most logins waiting on it runs first, so the real `meshdev` password jumps ahead of an attacker's guesses.
 What the queue cannot do is tell a lone cold `meshdev` login from a guess before hashing it: while `meshdev`'s
 own checks are all taken by guesses, that login is told "server busy" and retries. Limiting such a flood is a
-per-IP job (a later phase).
+per-IP job (the per-IP connect rate, below).
+
+### Limits and dedupe
+
+The `limits` section has two families of keys: the ones in [Limits](#limits) bound what one packet or one
+login may do, the ones below bound what one address, one client or one node may do. All of them have a
+default, are validated with a range at startup, and `0` means "off" wherever the table says so.
+
+**Per IP address** (applied in the broker's own TCP listener, when the connection is accepted, before a
+single MQTT byte is read):
+
+- `max_connections_per_ip` (16) caps how many connections one address may hold open at once. Over the cap
+  the socket is closed at once; the counter is given back on every close path, so it never leaks.
+- `connect_rate_per_ip_per_minute` (30) with the burst `connect_burst_per_ip` (10) is a token bucket: it
+  bounds how often one address may open a connection, and with it a flood of CONNECTs or password guesses.
+  The token is taken at the accept, so an address that only opens sockets and never speaks MQTT is bounded
+  too. This is what keeps a single-address flood from filling the password-hashing queue of the real
+  `meshdev` user and delaying a cold login from another address.
+
+**Per client** (the user that owns the session plus the client id):
+
+- `publish_rate_per_client_per_minute` (120) with the burst `publish_burst_per_client` (60) bounds how many
+  publishes one client may send. The budget dies with the session, and an idle client is forgotten.
+- `max_payload_size` (512) is the largest publish payload the broker looks at, in bytes. It is checked after
+  the publish ACL and before anything is parsed.
+
+**Per node** (the packet's `from`) and **per packet** (the cross-gateway dedupe):
+
+- `packet_rate_per_from_per_minute` (30) with the burst `packet_burst_per_from` (15) bounds how many packets
+  one node may send. A packet is charged **once**, on its first accepted copy, never once per gateway, and the
+  verdict is sticky: a packet whose first copy was refused is refused for every later copy too.
+- The dedupe is keyed by (`from`, packet id) and keeps **one copy per gateway** (the dashboards use each
+  gateway's copy to show who heard a packet and at what SNR, so collapsing to one copy per packet would lose
+  information). A copy from a gateway that already sent the packet is dropped
+  (`duplicate from the same gateway`); a copy from a new gateway is accepted while fewer than
+  `dedupe_max_gateways_per_packet` (32) gateways have sent it, and dropped above that
+  (`too many gateways for one packet`). A packet is forgotten `dedupe_window_seconds` (120) after it was
+  first seen, and the table never holds more than `dedupe_max_entries` (200000) packets: the oldest are
+  evicted. Map reports carry no packet id and are not deduplicated; each one is charged as one packet of its
+  node.
+
+The order of the checks in the publish hook is fixed: **publish ACL → payload cap → per-client rate →
+packet filter (including the gateway binding) → dedupe → per-node rate**. Every refusal is counted under
+its own reason, logged per packet at `debug` only, and never disconnects the client. On MQTT 5 a refused
+publish is answered with reason code `Quota exceeded` (151) for the payload cap, the per-client publish rate
+and the per-node packet rate, with `Not authorized` (135) for the publish ACL, and with **no** reason code
+for the packet filter and the dedupe (those copies are dropped, but the client is not told why); MQTT 3.1.1
+acknowledgements carry no reason code at all.
+
+The packet filter also checks the **gateway binding**: on `<root>/2/e/<channel>/<gateway>` the gateway level
+of the topic must be the `gateway_id` of the envelope, and it must be `!` followed by 8 lowercase hex digits
+(`NodeDB::getNodeId()`, the same string the firmware puts in both places, `src/mqtt/MQTT.cpp` `onSend()`).
+A topic whose gateway is something else is dropped (`gateway in topic does not match gateway_id`).
+
+Every table the broker keeps (per IP, per client, per node, per packet) has a hard entry cap and an idle
+expiry (the per-IP connection counter dies with its connection instead), and the evictions are counted (and
+counted again in the periodic summary, see [Logs](#logs)), so a flood of forged ids cannot grow the memory
+without bound.
+
+#### Residual risks
+
+- **With public credentials, a forged `from` can use up a real node's budget.** `meshdev`/`large4cats` are
+  public, so anyone can put any `from` in an envelope header and spend that node's per-node packet budget.
+  The per-client and per-IP limits bound how much of that an attacker can do at once, but they cannot tell
+  a forged `from` from a real one.
+- **Clients behind one address share the limits.** A CGNAT, a VPN or a tunnel puts many nodes behind one
+  IP address: they share the connection cap and the connect rate, and the fleet may be cut. Tune those
+  values (or set them to `0`) for the networks the real nodes use.
+- **Distributed floods are not covered here.** One address per flood is bounded; a flood from many addresses
+  is not. That is the job of fail2ban-style bans (phase 4).
 
 ### Logs
 
@@ -183,7 +268,15 @@ Logs never contain passwords or message payloads. At the default `information` l
   filters it carries.
 - Dropped publishes: one Information line every 60 s with the number of drops per reason, only when
   something was dropped. Publishes refused by the publish ACL are counted there too (`not in publish_allow`,
-  `invalid topic name`). Each dropped packet is logged individually only at `debug`.
+  `invalid topic name`), and so are the ones refused by the limits and the dedupe
+  (`payload larger than max_payload_size`, `publish rate exceeded for the client`,
+  `duplicate from the same gateway`, `too many gateways for one packet`, `packet rate exceeded for the node`)
+  and the connections refused at the accept (`too many connections from one IP`,
+  `too many connection attempts from one IP`). Each dropped packet is logged individually only at `debug`.
+- Evictions from the bounded tables are counted in the same summary, one reason per table:
+  `evicted: dedupe table full`, `evicted: per-node rate table full`, `evicted: per-client rate table full`,
+  `evicted: per-IP connection table full` and `evicted: per-IP rate table full`. A non-zero count means a
+  cap was reached (a flood of forged ids, most likely) and the oldest entries of that table were dropped.
 
 `debug` also logs every accepted packet (topic, client, `from`, packet id, portnum).
 
@@ -268,14 +361,14 @@ Test fixtures (`tests/Meshtastic.Mqtt.Tests/Fixtures/*.bin`) are real-format env
 
 ## Not in this version
 
-Rate limits per IP/client/node, duplicate suppression, fail2ban-style bans and TLS. See the
-"Ideas" list below for where this is heading. A payload cap for publishes belongs in the packet-size check
-above (it must act while the packet is read), not in the publish hook, which runs after allocation.
+Fail2ban-style bans and TLS. See the "Ideas" list below for where this is heading. The rate limits per
+IP, per client and per node, the cross-gateway dedupe and the publish payload cap are in
+[Limits and dedupe](#limits-and-dedupe); the payload cap acts in the publish hook, after the ACL, because
+the packet has already been read by then (the `max_packet_size` check is the one that acts while the packet
+is being read).
 
 ## Ideas for MQTT mesh moderation
 
-- Rate-limiting a packet we've heard before
-- Rate-limiting packets per node
 - "Zero hopping" certain packets
 - Blocking or rate-limiting certain portnums
 - Fail2ban style connection moderation
