@@ -13,7 +13,8 @@ exposed on the internet:
 - **No downlink by default**: a user may subscribe only to filters listed in its `subscribe_allow`.
   The public `meshdev` user gets none.
 - **Publish ACL**: a user may publish only to topics matching its `publish_allow`. Empty or missing = no publish.
-- **Packet filtering on publish**: drops empty, malformed, plaintext and undecryptable packets.
+- **Packet filtering on publish**: drops empty, malformed, plaintext and undecryptable packets; lets through
+  map reports only after checking they are real `MapReport`s.
 - **No message content in logs**, ever. Logs carry topic, client id, `from`, packet id and portnum.
 - Plain MQTT on port 1883. No TLS in this version.
 
@@ -54,14 +55,16 @@ The root topic for the Spanish mesh is `msh/EU_868`, the root the community guid
 (`meshtastic-es-community.github.io`, `docs/mapas.md`). It is also what the firmware writes for region EU_868
 (`AdminModule.cpp` → `MQTT::applyRegionRootTopic()`), but only while the node points at the default
 `mqtt.meshtastic.org` server with the default root; a node configured for another broker keeps whatever root it
-was given, so the root must be set by hand. The example config allows `meshdev` exactly `msh/EU_868/2/e/#`.
+was given, so the root must be set by hand. The example config allows `meshdev` exactly `msh/EU_868/2/e/#` and
+`msh/EU_868/2/map/`.
 
 ### Publish filtering
 
-A message that passed the publish ACL is forwarded only if all of these hold:
+A message that passed the publish ACL is forwarded only if it is either a map report (next section) or a
+channel packet for which all of these hold:
 
 1. The topic is `<root>/2/e/<channel>/<gateway>` (root may have several levels, e.g. `msh/EU_868`).
-   `/2/json/`, `/2/map/` and anything else is dropped.
+   `/2/json/` and anything else is dropped, and so is any `/2/map...` topic other than the exact map-report topic.
 2. The payload is a valid `ServiceEnvelope` with a `packet`, `channel_id` and `gateway_id`.
 3. `channel_id` equals the `<channel>` segment of the topic (exact match).
 4. The packet has non-zero `from` and `id` and carries an `encrypted` payload of 1-256 bytes
@@ -77,6 +80,27 @@ A message that passed the publish ACL is forwarded only if all of these hold:
 
 The firmware's channel hash (`MeshPacket.channel`) is also computed for the configured key. A mismatch
 is logged at `debug` level only; it never causes a drop.
+
+### Map reports
+
+Nodes with "map reporting" enabled publish a `MapReport` (name, hardware, firmware, region, preset, approximate
+position) for map dashboards. Checked in the firmware (`src/mqtt/MQTT.cpp`, `MQTT::perhapsReportToMap()`), the
+topic is exactly `<root>/2/map/` — trailing slash included, no channel or gateway level — and the payload is a
+`ServiceEnvelope` whose packet is **decoded** (plaintext, never encrypted), `portnum = MAP_REPORT_APP` (73), with the
+`MapReport` protobuf as payload, `from` = the reporting node, `channel_id` = its primary channel and
+`gateway_id` = `!` + 8 lowercase hex digits of its node number. The firmware leaves the packet id at 0.
+
+A message on `<root>/2/map/` is forwarded only if all of these hold, each failure being its own drop reason:
+
+1. The payload parses as a `ServiceEnvelope` with a packet whose `from` is not 0.
+2. The packet is decoded, not encrypted.
+3. Its portnum is `MAP_REPORT_APP`.
+4. Its payload is non-empty and parses as a `MapReport`.
+5. `gateway_id` equals `!%08x` of `from` (a node only reports itself).
+
+No channel key is involved (the topic names no channel and the packet is plaintext), and there is no separate
+flag: whoever has the map topic in `publish_allow` may send map reports. `<root>/2/map` (no slash) and
+`<root>/2/map/<anything>` are dropped; the firmware never publishes there.
 
 ### PKI direct messages (`drop_pki`)
 

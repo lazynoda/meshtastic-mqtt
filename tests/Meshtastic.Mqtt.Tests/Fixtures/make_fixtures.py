@@ -139,6 +139,66 @@ REAL_ENC = base64.b64decode("kiDV39nDDsi8AON+Czei6zUpy+F/7E+lyIpicxJR40KXBFmPkqF
 FIXTURES["longfast_real.bin"] = envelope(
     mesh_packet(4202784164, BROADCAST, 8, REAL_ENC, 1777428186), "LongFast", "!fa8165a4")
 
+
+# --- Map reports ---------------------------------------------------------------------------------------------
+# Mirrors meshtastic/firmware src/mqtt/MQTT.cpp MQTT::perhapsReportToMap() (develop, Oct 2026):
+# - topic: mapTopic = root + "/2/map/" (MQTT::reinitTopics()), trailing slash, no channel or gateway level;
+# - a zeroed MeshPacket (packetPool.allocZeroed(), so id = 0, channel = 0, hop fields 0) with
+#   which_payload_variant = decoded, from = own node number, to = broadcast, portnum = MAP_REPORT_APP (73),
+#   payload = MapReport (meshtastic/mqtt.proto);
+# - ServiceEnvelope channel_id = primary channel's global id, gateway_id = nodeDB->getNodeId() = "!%08x" of from.
+# MapReport field numbers from meshtastic/protobufs meshtastic/mqtt.proto.
+MAP_REPORT_APP = 73
+POSITION_APP = 3
+
+
+def f_string(field, value):
+    return f_bytes(field, value.encode())
+
+
+def precise(coord_i, precision):
+    """Position truncation exactly as perhapsReportToMap(): mask to `precision` bits, then add half a step."""
+    masked = (coord_i & 0xFFFFFFFF) & ((0xFFFFFFFF << (32 - precision)) & 0xFFFFFFFF)
+    return (masked + (1 << (31 - precision))) & 0xFFFFFFFF
+
+
+def map_report_msg(long_name, short_name, lat_i, lon_i, precision=14):
+    # Enum values from meshtastic/config.proto and mesh.proto: role ROUTER = 2, hw_model RAK4631 = 9,
+    # region EU_868 = 3, modem_preset SHORT_FAST = 6.
+    return (f_string(1, long_name) + f_string(2, short_name) + f_varint(3, 2) + f_varint(4, 9)
+            + f_string(5, "2.7.15.567b8ea") + f_varint(6, 3) + f_varint(7, 6) + f_varint(8, 1)
+            + f_fixed32(9, precise(lat_i, precision)) + f_fixed32(10, precise(lon_i, precision))
+            + f_varint(11, 667) + f_varint(12, precision) + f_varint(13, 42) + f_varint(14, 1))
+
+
+def decoded_packet(sender, to, data):
+    # Field 4 = decoded; id, channel and hop fields are 0 and therefore omitted, as nanopb does for proto3.
+    return f_fixed32(1, sender) + f_fixed32(2, to) + f_bytes(4, data)
+
+
+MAP_NODE = 0x1A2B3C4D
+MAP_REPORT = map_report_msg("Nodo Mapa Madrid", "MAPA", 404168000, -37038000)
+
+FIXTURES.update({
+    # A valid map report, as perhapsReportToMap() publishes it to <root>/2/map/.
+    "map_report.bin": envelope(decoded_packet(MAP_NODE, BROADCAST, data_msg(MAP_REPORT_APP, MAP_REPORT)),
+                               "SFNarrow", "!1a2b3c4d"),
+    # Same MapReport bytes, but the packet is encrypted (default key) instead of decoded.
+    "map_report_encrypted.bin": envelope(
+        mesh_packet(MAP_NODE, BROADCAST, channel_hash("SFNarrow", expand("AQ==")),
+                    aes_ctr(expand("AQ=="), 0x10000009, MAP_NODE, data_msg(MAP_REPORT_APP, MAP_REPORT)), 0x10000009),
+        "SFNarrow", "!1a2b3c4d"),
+    # Decoded, but labelled POSITION_APP instead of MAP_REPORT_APP.
+    "map_report_wrong_portnum.bin": envelope(decoded_packet(MAP_NODE, BROADCAST, data_msg(POSITION_APP, MAP_REPORT)),
+                                             "SFNarrow", "!1a2b3c4d"),
+    # MAP_REPORT_APP whose payload is not a protobuf (an unterminated varint).
+    "map_report_garbage.bin": envelope(decoded_packet(MAP_NODE, BROADCAST, data_msg(MAP_REPORT_APP, b"\xff" * 11)),
+                                       "SFNarrow", "!1a2b3c4d"),
+    # A valid report relayed under another node's id: gateway_id is not "!%08x" of from.
+    "map_report_wrong_gateway.bin": envelope(decoded_packet(MAP_NODE, BROADCAST, data_msg(MAP_REPORT_APP, MAP_REPORT)),
+                                             "SFNarrow", "!deadbeef"),
+})
+
 if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
     for name, blob in FIXTURES.items():

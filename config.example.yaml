@@ -59,11 +59,14 @@ users:
   # connected). Root msh/EU_868 is the root the Spanish community guide tells nodes to set
   # (meshtastic-es-community.github.io, docs/mapas.md). Allowed:
   #   msh/EU_868/2/e/#     encrypted channel packets, msh/EU_868/2/e/<channel>/<gateway>
+  #   msh/EU_868/2/map/    map reports; the firmware publishes them to exactly this topic, trailing slash included
+  #                        (MQTT.cpp: mapTopic = root + "/2/map/"), and the broker checks they really are MapReports.
   # Generate a hash with: docker run --rm -i <image> hash-password
   - username: meshdev
     password_hash: "pbkdf2-sha256$600000$iqngz3pWU8HFZn8xIv8/IQ==$ZhdEPkHgqnG2zbHe26j6U598nTyFTA8J/Kzm7WCxDuA="
     publish_allow:
       - "msh/EU_868/2/e/#"
+      - "msh/EU_868/2/map/"
 
   # Example downlink user: may subscribe only to filters fully inside these MQTT topic filters.
   # "msh/EU_868/2/e/#" allows msh/EU_868/2/e/# and anything below it, but never msh/# or msh/+/2/e/#.

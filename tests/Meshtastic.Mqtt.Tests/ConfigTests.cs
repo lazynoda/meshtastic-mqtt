@@ -88,7 +88,7 @@ public class ConfigTests
         var meshdev = Assert.Single(c.Users!);
         Assert.Equal("meshdev", meshdev.Username);
         Assert.Empty(meshdev.SubscribeAllow!);
-        Assert.Equal(["msh/EU_868/2/e/#"], meshdev.PublishAllow!);
+        Assert.Equal(["msh/EU_868/2/e/#", "msh/EU_868/2/map/"], meshdev.PublishAllow!);
         Assert.True(meshdev.ParsedHash!.Verify("large4cats"u8));
         Assert.True(c.DropUndecryptable);
         Assert.True(c.DropPki);

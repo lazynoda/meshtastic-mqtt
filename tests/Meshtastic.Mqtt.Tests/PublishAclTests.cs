@@ -15,8 +15,8 @@ using static Meshtastic.Mqtt.Tests.TestSupport;
 namespace Meshtastic.Mqtt.Tests;
 
 /// <summary>
-/// The per-user publish ACL (<c>publish_allow</c>) on the production root msh/EU_868, and what a refused publish
-/// does (and does not do) to the publisher and to subscribers.
+/// The per-user publish ACL (<c>publish_allow</c>) on the production root msh/EU_868, map reports end to end, and
+/// what a refused publish does (and does not do) to the publisher and to subscribers.
 /// </summary>
 public sealed class PublishAclTests : IAsyncLifetime
 {
@@ -290,6 +290,45 @@ public sealed class PublishAclTests : IAsyncLifetime
         var summary = Assert.Single(_logs.Events, e => e.Level == LogEventLevel.Information && e.MessageTemplate.Text.StartsWith("Dropped {Total}"));
         Assert.Equal("20", summary.Properties["Total"].ToString());
         Assert.Contains("not in publish_allow", summary.RenderMessage());
+    }
+
+    [Fact]
+    public async Task MapReports_ValidOnesAreDelivered_InvalidOnesAreNot()
+    {
+        var received = await Dashboard();
+        var (meshdev, _) = await Connect("meshdev", "large4cats", "!1a2b3c4d");
+
+        await Publish(meshdev, MapTopic, "map_report_encrypted.bin");
+        await Publish(meshdev, MapTopic, "map_report_wrong_portnum.bin");
+        await Publish(meshdev, MapTopic, "map_report_garbage.bin");
+        await Publish(meshdev, MapTopic, "map_report_wrong_gateway.bin");
+        await Publish(meshdev, MapTopic, "sfnarrow_aq.bin");
+        await Publish(meshdev, "msh/EU_868/2/map/!1a2b3c4d", "map_report.bin");   // not in meshdev's list
+        await Publish(meshdev, MapTopic, "map_report.bin");
+        Assert.True(await WaitUntil(() => !received.IsEmpty));
+        await Task.Delay(300, Ct);
+
+        Assert.Equal([$"{MapTopic} {PublishFilterTests.Fixture("map_report.bin").Length}"], received.ToArray());
+        _flushDrops();
+        var summary = Assert.Single(_logs.Events, e => e.MessageTemplate.Text.StartsWith("Dropped {Total}")).RenderMessage();
+        foreach (var reason in new[] { "map report: packet is not decoded", "map report: portnum is not MAP_REPORT_APP",
+                     "map report: payload is not a MapReport", "map report: gateway_id is not the sender (from)", "not in publish_allow" })
+            Assert.Contains(reason, summary);
+    }
+
+    [Fact]
+    public async Task MapTopicWithAnExtraLevel_IsDropped_EvenWhenTheAclAllowsIt()
+    {
+        // root may publish anywhere, so only the packet filter stands between it and <root>/2/map/<anything>.
+        var received = await Dashboard();
+        var (root, _) = await Connect("root", AlicePassword, "root-1");
+        await Publish(root, "msh/EU_868/2/map/!1a2b3c4d", "map_report.bin");
+        await Publish(root, "msh/EU_868/2/map", "map_report.bin");
+        await Publish(root, MapTopic, "map_report.bin");
+        Assert.True(await WaitUntil(() => !received.IsEmpty));
+        await Task.Delay(300, Ct);
+        Assert.Equal([$"{MapTopic} {PublishFilterTests.Fixture("map_report.bin").Length}"], received.ToArray());
+        Assert.Equal(2, _logs.Events.Count(e => e.RenderMessage().Contains("unsupported map topic")));
     }
 
     // ---- Wildcards in a PUBLISH topic name (MQTTnet's client refuses to send them, so raw bytes) ---------------

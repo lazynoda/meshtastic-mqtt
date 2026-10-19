@@ -41,8 +41,14 @@ public sealed class PacketInspector(BrokerConfig config)
     {
         if (payload.IsEmpty)
             return Drop("empty payload");
+        if (IsMapReportTopic(topic))
+            return InspectMapReport(payload);
         if (!TryParseTopic(topic, out var topicChannel))
-            return Drop("unsupported topic (expected <root>/2/e/<channel>/<gateway>)");
+        {
+            return HasMapLevels(topic)
+                ? Drop("unsupported map topic (expected <root>/2/map/)")
+                : Drop("unsupported topic (expected <root>/2/e/<channel>/<gateway>)");
+        }
 
         ServiceEnvelope envelope;
         try
@@ -93,6 +99,81 @@ public sealed class PacketInspector(BrokerConfig config)
         return config.DropPki
             ? Drop("PKI DM (drop_pki: true)", PkiChannel, packet)
             : new Inspection(true, "PKI DM passed through opaquely (drop_pki: false)", PkiChannel, packet.From, packet.Id);
+    }
+
+    /// <summary>
+    /// A map report as the firmware publishes it (<c>src/mqtt/MQTT.cpp</c> <c>perhapsReportToMap()</c>): a
+    /// ServiceEnvelope around a <b>decoded</b> MeshPacket with portnum MAP_REPORT_APP whose payload is a
+    /// <c>MapReport</c>, sent by the reporting node itself, so <c>gateway_id</c> is <c>!%08x</c> of <c>from</c>.
+    /// The packet id is left 0 by the firmware (zeroed packet, never assigned), so it is not required. No channel key
+    /// applies: the topic names no channel and the packet is plaintext.
+    /// </summary>
+    static Inspection InspectMapReport(ReadOnlySpan<byte> payload)
+    {
+        ServiceEnvelope envelope;
+        try
+        {
+            envelope = ServiceEnvelope.Parser.ParseFrom(payload);
+        }
+        catch (InvalidProtocolBufferException)
+        {
+            return Drop("map report: malformed protobuf");
+        }
+
+        var packet = envelope.Packet;
+        if (packet is null)
+            return Drop("map report: envelope without packet");
+        if (packet.From == 0)
+            return Drop("map report: packet without from", packet: packet);
+        if (packet.PayloadVariantCase != MeshPacket.PayloadVariantOneofCase.Decoded)
+            return Drop("map report: packet is not decoded", packet: packet);
+        var data = packet.Decoded;
+        if (data.Portnum != PortNum.MapReportApp)
+            return Drop("map report: portnum is not MAP_REPORT_APP", packet: packet);
+        // The firmware always sets has_opted_report_location, so a real report is never the empty message.
+        if (data.Payload.IsEmpty)
+            return Drop("map report: payload is not a MapReport", packet: packet);
+        try
+        {
+            MapReport.Parser.ParseFrom(data.Payload);
+        }
+        catch (InvalidProtocolBufferException)
+        {
+            return Drop("map report: payload is not a MapReport", packet: packet);
+        }
+        if (!string.Equals(envelope.GatewayId, $"!{packet.From:x8}", StringComparison.Ordinal))
+            return Drop("map report: gateway_id is not the sender (from)", packet: packet);
+
+        return new Inspection(true, "map report", null, packet.From, packet.Id, PortNum.MapReportApp);
+    }
+
+    /// <summary>
+    /// The map-report topic exactly as the firmware builds it: <c>&lt;root&gt;/2/map/</c> (<c>MQTT::reinitTopics()</c>,
+    /// <c>mapTopic = root + "/2/map/"</c>), with the trailing slash, so the last level is empty and there is no
+    /// channel or gateway level. Root is one or more non-empty levels.
+    /// </summary>
+    public static bool IsMapReportTopic(string? topic)
+    {
+        if (string.IsNullOrEmpty(topic))
+            return false;
+        var levels = topic.Split('/');
+        var n = levels.Length;
+        return n >= 4 && levels[n - 1].Length == 0 && levels[n - 2] == "map" && levels[n - 3] == "2"
+            && !levels.Take(n - 3).Any(string.IsNullOrEmpty);
+    }
+
+    /// <summary>Any other topic with a <c>2/map</c> pair of levels (extra levels, no trailing slash): never published by the firmware.</summary>
+    static bool HasMapLevels(string? topic)
+    {
+        if (string.IsNullOrEmpty(topic))
+            return false;
+        var levels = topic.Split('/');
+        for (var i = 1; i < levels.Length; i++)
+        {
+            if (levels[i - 1] == "2" && levels[i] == "map")
+                return true;
+        }
+        return false;
     }
 
     /// <summary>Same success test as firmware <c>perhapsDecode()</c>: Data parses and portnum is not UNKNOWN_APP.</summary>
