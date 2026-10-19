@@ -136,6 +136,13 @@ public sealed class BrokerConfig
                 if (!TopicFilter.IsValid(filter, out var filterError))
                     errors.Add($"{where}.subscribe_allow: {filterError}");
             }
+
+            user.PublishAllow ??= [];
+            foreach (var filter in user.PublishAllow)
+            {
+                if (!TopicFilter.IsValid(filter, out var filterError))
+                    errors.Add($"{where}.publish_allow: {filterError}");
+            }
         }
         return errors;
     }
@@ -216,6 +223,11 @@ public sealed class UserConfig
 
     /// <summary>MQTT topic filters this user may subscribe to. Empty or missing = no subscribe at all.</summary>
     public List<string>? SubscribeAllow { get; set; } = new();
+
+    /// <summary>
+    /// MQTT topic filters a PUBLISH topic name must match for this user. Empty or missing = no publish at all.
+    /// </summary>
+    public List<string>? PublishAllow { get; set; } = new();
 
     [YamlIgnore] public PasswordHash? ParsedHash { get; internal set; }
 }

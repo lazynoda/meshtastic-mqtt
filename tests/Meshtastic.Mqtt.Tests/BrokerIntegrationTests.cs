@@ -39,6 +39,7 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
             users:
               - username: meshdev
                 password_hash: "{AuthTests.MeshdevHash}"
+                publish_allow: [msh/ES/2/e/#]
               - username: alice
                 password_hash: "{AuthTests.AliceHash}"
                 subscribe_allow: [msh/ES/2/e/test/#, msh/ES/2/e/Test/#]

@@ -12,6 +12,7 @@ exposed on the internet:
 - **Real authentication**: users with PBKDF2-SHA256 password hashes, compared in constant time.
 - **No downlink by default**: a user may subscribe only to filters listed in its `subscribe_allow`.
   The public `meshdev` user gets none.
+- **Publish ACL**: a user may publish only to topics matching its `publish_allow`. Empty or missing = no publish.
 - **Packet filtering on publish**: drops empty, malformed, plaintext and undecryptable packets.
 - **No message content in logs**, ever. Logs carry topic, client id, `from`, packet id and portnum.
 - Plain MQTT on port 1883. No TLS in this version.
@@ -22,17 +23,44 @@ exposed on the internet:
 |---|---|
 | Connect | Username and password are checked against `users`. Unknown user or wrong password → `BadUserNameOrPassword` (MQTT 3.1.1 return code 4), logged with username and remote IP, never the password. A reconnect with an existing client id takes over the old session, but only for the **same user**: a client id held by a live or persisted session of another user is refused with `ClientIdentifierNotValid` (3.1.1 return code 2) and the session owner stays connected. The id is free again once that session is gone. If the password-check queue is full (see `limits`), the client gets `ServerBusy` (3.1.1 return code 3, "server unavailable") and retries. |
 | Subscribe | The requested filter is granted only if **every** topic it can match is covered by the `subscribe_allow` filters of the user that **created the session** (bound at connect time, so a reused session never changes hands). Real MQTT wildcard semantics, not prefix matching. An empty or missing list denies everything. `#` and `+` never grant `$`-topics such as `$SYS/#`. Refusal → MQTT 5 reason `Not authorized` (135); on MQTT 3.1.1 → `0x80`. |
-| Publish | See below. Accepted messages are re-published with `retain` cleared (firmware never retains), so nothing enters the retained-message store. |
+| Publish | First the publish ACL (below), then the packet filter (below). A refused publish is dropped, never forwarded, and the client stays connected. Accepted messages are re-published with `retain` cleared (firmware never retains), so nothing enters the retained-message store. |
 
 Before any of this, every packet's declared length is checked against `limits.max_packet_size` while its
 fixed header is still being read; a larger one closes the connection before the broker allocates it
 (also for clients that have not authenticated yet).
 
+### Publish ACL
+
+Each user has `publish_allow`, a list of MQTT topic filters. A PUBLISH is accepted only if its topic name
+matches at least one of them, with standard MQTT matching: `+` is exactly one level, `#` is that level and
+everything below it (so `msh/EU_868/2/e/#` also matches `msh/EU_868/2/e`, which the packet filter then drops),
+and a filter starting with a wildcard never matches a `$` topic such as `$SYS/...`. Topics are case-sensitive.
+
+- **Empty or missing = no publish at all.** This is a breaking change for configs written before the publish
+  ACL existed: give `meshdev` (and any user that must publish) an explicit list, as in
+  [`config.example.yaml`](config.example.yaml).
+- The list is the one of the user that **created the session** (bound at connect time, like `subscribe_allow`),
+  not the username of the current connection. A session with no owner publishes nothing.
+- An invalid filter (`#` not last, `+` or `#` inside a level, empty) stops the broker at startup.
+- A topic name containing `+` or `#` is a protocol error (wildcards are for filters only); MQTTnet does not reject it
+  on the server side, so the broker drops it as `invalid topic name`.
+- A refused publish is dropped and counted under `not in publish_allow` (see [Logs](#logs)); it is logged per
+  packet only at `debug`, so a node configured with the wrong root topic cannot flood the log. The client is
+  **not** disconnected (the firmware would just reconnect in a loop). On MQTT 5 a QoS 1/2 publish is answered
+  with reason code `Not authorized` (135), or `Topic name invalid` (144) for a wildcard in the topic name;
+  MQTT 3.1.1 acknowledgements carry no reason code.
+
+The root topic for the Spanish mesh is `msh/EU_868`, the root the community guide tells every node to set
+(`meshtastic-es-community.github.io`, `docs/mapas.md`). It is also what the firmware writes for region EU_868
+(`AdminModule.cpp` → `MQTT::applyRegionRootTopic()`), but only while the node points at the default
+`mqtt.meshtastic.org` server with the default root; a node configured for another broker keeps whatever root it
+was given, so the root must be set by hand. The example config allows `meshdev` exactly `msh/EU_868/2/e/#`.
+
 ### Publish filtering
 
-A message is forwarded only if all of these hold:
+A message that passed the publish ACL is forwarded only if all of these hold:
 
-1. The topic is `<root>/2/e/<channel>/<gateway>` (root may have several levels, e.g. `msh/ES`).
+1. The topic is `<root>/2/e/<channel>/<gateway>` (root may have several levels, e.g. `msh/EU_868`).
    `/2/json/`, `/2/map/` and anything else is dropped.
 2. The payload is a valid `ServiceEnvelope` with a `packet`, `channel_id` and `gateway_id`.
 3. `channel_id` equals the `<channel>` segment of the topic (exact match).
@@ -89,6 +117,7 @@ Start from [`config.example.yaml`](config.example.yaml).
 | `users[].username` | required | Case-sensitive. |
 | `users[].password_hash` | required | `pbkdf2-sha256$<iterations>$<salt>$<hash>`, see below. |
 | `users[].subscribe_allow` | empty | MQTT topic filters this user may subscribe within. Empty = no subscribe at all. |
+| `users[].publish_allow` | empty | MQTT topic filters a PUBLISH topic of this user must match (see [Publish ACL](#publish-acl)). Empty = no publish at all. |
 | `limits.max_packet_size` | `4096` | Largest MQTT packet accepted, in bytes (Remaining Length). Checked before the packet is allocated; a larger one closes the connection. Range 512-1048576. |
 | `limits.communication_timeout_seconds` | `10` | How long a new connection may take to send CONNECT, and a write may stall (MQTTnet's default is 100). |
 | `limits.auth_queue_timeout_seconds` | `3` | How long a login may wait for a password-hashing slot before it is answered "server busy". |
@@ -129,7 +158,8 @@ Logs never contain passwords or message payloads. At the default `information` l
 - A refused SUBSCRIBE: one Warning per packet (count of refused filters and the first one), however many
   filters it carries.
 - Dropped publishes: one Information line every 60 s with the number of drops per reason, only when
-  something was dropped. Each dropped packet is logged individually only at `debug`.
+  something was dropped. Publishes refused by the publish ACL are counted there too (`not in publish_allow`,
+  `invalid topic name`). Each dropped packet is logged individually only at `debug`.
 
 `debug` also logs every accepted packet (topic, client, `from`, packet id, portnum).
 
@@ -214,7 +244,7 @@ Test fixtures (`tests/Meshtastic.Mqtt.Tests/Fixtures/*.bin`) are real-format env
 
 ## Not in this version
 
-Publish ACLs, rate limits per IP/client/node, duplicate suppression, fail2ban-style bans and TLS. See the
+Rate limits per IP/client/node, duplicate suppression, fail2ban-style bans and TLS. See the
 "Ideas" list below for where this is heading. A payload cap for publishes belongs in the packet-size check
 above (it must act while the packet is read), not in the publish hook, which runs after allocation.
 

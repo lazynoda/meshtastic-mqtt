@@ -55,13 +55,21 @@ limits:
 users:
   # Firmware default credentials (meshdev / large4cats). Public by design, so uplink only:
   # no subscribe_allow means this user cannot subscribe to anything.
+  # publish_allow: MQTT topic filters every PUBLISH topic must match; anything else is dropped (the client stays
+  # connected). Root msh/EU_868 is the root the Spanish community guide tells nodes to set
+  # (meshtastic-es-community.github.io, docs/mapas.md). Allowed:
+  #   msh/EU_868/2/e/#     encrypted channel packets, msh/EU_868/2/e/<channel>/<gateway>
   # Generate a hash with: docker run --rm -i <image> hash-password
   - username: meshdev
     password_hash: "pbkdf2-sha256$600000$iqngz3pWU8HFZn8xIv8/IQ==$ZhdEPkHgqnG2zbHe26j6U598nTyFTA8J/Kzm7WCxDuA="
+    publish_allow:
+      - "msh/EU_868/2/e/#"
 
   # Example downlink user: may subscribe only to filters fully inside these MQTT topic filters.
-  # "msh/ES/2/e/Test/#" allows msh/ES/2/e/Test/# and anything below it, but never msh/# or msh/ES/2/e/+/#.
+  # "msh/EU_868/2/e/#" allows msh/EU_868/2/e/# and anything below it, but never msh/# or msh/+/2/e/#.
+  # publish_allow is empty on purpose: a dashboard only reads, and an empty or missing list means no publish at all.
   # - username: dashboard
   #   password_hash: "pbkdf2-sha256$600000$<salt>$<hash>"
   #   subscribe_allow:
-  #     - "msh/ES/2/e/#"
+  #     - "msh/EU_868/2/e/#"
+  #   publish_allow: []

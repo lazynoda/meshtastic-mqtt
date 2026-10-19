@@ -75,6 +75,43 @@ public static class TopicFilter
         }
     }
 
+    /// <summary>
+    /// A PUBLISH topic name: non-empty, no NUL, at most 65535 bytes, and no wildcard characters (spec 4.7.1: '+' and
+    /// '#' are only for filters). MQTTnet 5.2.0 does not check this on the server side; it hands such a topic name to
+    /// the publish hook as received.
+    /// </summary>
+    public static bool IsValidTopicName(string? topic, out string? error)
+    {
+        error = null;
+        if (string.IsNullOrEmpty(topic))
+            error = "topic name is empty";
+        else if (topic.Contains('\0'))
+            error = "topic name contains a NUL character";
+        else if (topic.IndexOfAny(['+', '#']) >= 0)
+            error = "topic name contains a wildcard ('+' or '#')";
+        else if (Encoding.UTF8.GetByteCount(topic) > 65535)
+            error = "topic name is longer than 65535 bytes";
+        return error is null;
+    }
+
+    /// <summary>
+    /// Whether the topic name <paramref name="topic"/> matches at least one filter of <paramref name="allowList"/>,
+    /// with standard MQTT matching: '+' is one level, '#' that level and everything below, and a leading wildcard
+    /// never matches a '$' topic. An empty allow-list or an invalid topic name matches nothing.
+    /// </summary>
+    public static bool MatchesAny(IReadOnlyCollection<string> allowList, string? topic)
+    {
+        if (allowList.Count == 0 || !IsValidTopicName(topic, out _))
+            return false;
+        // A topic name is a filter without wildcards, so "covers" is exactly "matches" here.
+        foreach (var allowed in allowList)
+        {
+            if (Covers(allowed, topic!))
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>An empty allow-list denies everything.</summary>
     public static bool IsAllowed(IReadOnlyCollection<string> allowList, string? requested)
     {

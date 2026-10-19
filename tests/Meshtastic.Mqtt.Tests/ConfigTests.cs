@@ -25,7 +25,60 @@ public class ConfigTests
         Assert.True(c.DropPki);
         Assert.Equal("AQ==", c.DefaultPsk);
         Assert.Empty(c.Users![0].SubscribeAllow!);
+        Assert.Empty(c.Users![0].PublishAllow!);
         Assert.Equal(Serilog.Events.LogEventLevel.Information, c.MinimumLevel);
+    }
+
+    [Theory]
+    [InlineData("")]                        // key left out
+    [InlineData("    publish_allow:\n")]    // empty value
+    [InlineData("    publish_allow: []\n")]
+    public void MissingOrEmptyPublishAllow_IsAnEmptyList(string line)
+    {
+        // Empty = no publish at all (enforced in the publish hook; see PublishAclTests).
+        var c = ConfigLoader.Parse($"users:\n  - username: a\n    password_hash: \"{Hash}\"\n{line}");
+        Assert.NotNull(c.Users![0].PublishAllow);
+        Assert.Empty(c.Users![0].PublishAllow!);
+    }
+
+    [Fact]
+    public void PublishAllow_IsParsedPerUser()
+    {
+        var c = ConfigLoader.Parse(
+            $"users:\n  - username: a\n    password_hash: \"{Hash}\"\n    publish_allow: ['msh/EU_868/2/e/#', 'msh/EU_868/2/map/', 'msh/+/2/e/Test/+']\n"
+            + $"  - username: b\n    password_hash: \"{Hash}\"\n");
+        Assert.Equal(["msh/EU_868/2/e/#", "msh/EU_868/2/map/", "msh/+/2/e/Test/+"], c.Users![0].PublishAllow!);
+        Assert.Empty(c.Users![1].PublishAllow!);
+    }
+
+    [Theory]
+    [InlineData("msh/#/x", "'#' must be a whole level and the last one")]
+    [InlineData("msh/EU_868/2/e#", "'#' must be a whole level and the last one")]
+    [InlineData("msh/EU+/2/e/#", "'+' must be a whole level")]
+    [InlineData("", "topic filter is empty")]
+    public void InvalidPublishFilter_FailsStartup_NamingUserKeyAndProblem(string filter, string problem)
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(
+            $"users:\n  - username: a\n    password_hash: \"{Hash}\"\n    publish_allow: ['msh/EU_868/2/e/#', '{filter}']\n"));
+        Assert.Contains("users[a].publish_allow: ", ex.Message);
+        Assert.Contains(problem, ex.Message);
+    }
+
+    [Fact]
+    public void InvalidPublishFilter_InAConfigFile_GivesOneClearStartupLine()
+    {
+        // Program prints this message under "Invalid config '<path>':" and exits with code 1.
+        var path = Path.Combine(AppContext.BaseDirectory, $"bad-publish-{Guid.NewGuid():N}.yaml");
+        File.WriteAllText(path, $"users:\n  - username: meshdev\n    password_hash: \"{Hash}\"\n    publish_allow: ['msh/#/e']\n");
+        try
+        {
+            var ex = Assert.Throws<ConfigException>(() => ConfigLoader.LoadFile(path));
+            Assert.Equal("- users[meshdev].publish_allow: '#' must be a whole level and the last one: 'msh/#/e'", ex.Message);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 
     [Fact]
@@ -35,6 +88,7 @@ public class ConfigTests
         var meshdev = Assert.Single(c.Users!);
         Assert.Equal("meshdev", meshdev.Username);
         Assert.Empty(meshdev.SubscribeAllow!);
+        Assert.Equal(["msh/EU_868/2/e/#"], meshdev.PublishAllow!);
         Assert.True(meshdev.ParsedHash!.Verify("large4cats"u8));
         Assert.True(c.DropUndecryptable);
         Assert.True(c.DropPki);

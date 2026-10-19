@@ -46,6 +46,7 @@ public sealed class BrokerHooks
     readonly Authenticator _authenticator;
     readonly PacketInspector _inspector;
     readonly Dictionary<string, IReadOnlyCollection<string>> _subscribeAllow = new(StringComparer.Ordinal);
+    readonly Dictionary<string, IReadOnlyCollection<string>> _publishAllow = new(StringComparer.Ordinal);
 
     // Client id -> user owning it, mirroring MQTTnet's session store. A claim is taken (pending) when a CONNECT
     // passes authentication, marked connected when MQTTnet reports the client connected, and removed when its
@@ -89,7 +90,10 @@ public sealed class BrokerHooks
         _inspector = new PacketInspector(config);
         Drops = drops ?? new DropCounters(log, start: false);
         foreach (var user in users)
+        {
             _subscribeAllow[user.Username] = (user.SubscribeAllow ?? []).ToArray();
+            _publishAllow[user.Username] = (user.PublishAllow ?? []).ToArray();
+        }
     }
 
     internal DropCounters Drops { get; }
@@ -482,6 +486,23 @@ public sealed class BrokerHooks
         {
             var message = args.ApplicationMessage;
             var topic = message?.Topic;
+
+            // Publish ACL first: it is cheap and needs no payload. Evaluated against the user bound to the session at
+            // connect time (see OwnerKey), never args.UserName; no owner means no publish.
+            var owner = args.SessionItems?[OwnerKey] as string;
+            var (denyCode, denyReason) = EvaluatePublish(owner, topic);
+            if (denyCode is not null)
+            {
+                // The client stays connected (firmware reconnects in a loop) and the refusal is Debug per packet plus
+                // the periodic summary: a node configured with the wrong root would otherwise flood the log.
+                args.ProcessPublish = false;
+                args.Response.ReasonCode = denyCode.Value;   // MQTT 5 PUBACK/PUBREC only; 3.1.1 acks carry no code
+                Drops.Increment(denyReason);
+                _log.Debug("Dropped publish on {Topic} from {ClientId} ({Username}): {Reason}",
+                    Trim(topic), Trim(args.ClientId), Trim(owner ?? args.UserName), denyReason);
+                return Task.CompletedTask;
+            }
+
             var payload = message is null ? [] : message.Payload.ToArray();
             var result = _inspector.Inspect(topic, payload);
 
@@ -516,6 +537,23 @@ public sealed class BrokerHooks
     }
 
     static string NodeId(uint node) => $"!{node:x8}";
+
+    /// <summary>Drop reasons of the publish ACL, as counted in <see cref="Drops"/>.</summary>
+    internal const string InvalidTopicNameReason = "invalid topic name";
+    internal const string NoOwnerReason = "publish without a session owner";
+    internal const string NotInPublishAllowReason = "not in publish_allow";
+
+    /// <summary>Null code = allowed; otherwise the PUBACK reason code (MQTT 5) and the drop reason.</summary>
+    internal (MqttPubAckReasonCode? Code, string Reason) EvaluatePublish(string? owner, string? topic)
+    {
+        // MQTTnet 5.2.0 passes the topic name as received: it does not reject '+' or '#' in a PUBLISH on the server.
+        if (!TopicFilter.IsValidTopicName(topic, out _))
+            return (MqttPubAckReasonCode.TopicNameInvalid, InvalidTopicNameReason);
+        if (owner is null)
+            return (MqttPubAckReasonCode.NotAuthorized, NoOwnerReason);
+        var allow = _publishAllow.TryGetValue(owner, out var list) ? list : [];
+        return TopicFilter.MatchesAny(allow, topic) ? (null, "allowed") : (MqttPubAckReasonCode.NotAuthorized, NotInPublishAllowReason);
+    }
 
     /// <summary>Bounds and de-controls client-supplied strings before they reach the log.</summary>
     internal static string Trim(string? value, int max = 128)

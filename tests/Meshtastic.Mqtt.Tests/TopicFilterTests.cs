@@ -144,6 +144,48 @@ public class TopicFilterTests
         }
     }
 
+    /// <summary>
+    /// The publish ACL's topic-name matching agrees exactly with the reference matcher, both ways, over the same
+    /// universe (every topic name there is non-empty and wildcard-free, so all are valid).
+    /// </summary>
+    [Fact]
+    public void MatchesAny_EqualsTheReferenceMatcher_OverSmallUniverse()
+    {
+        string[] levels = ["a", "b", "$x", ""];
+        var topics = new List<string>();
+        void Build(string prefix, int depth)
+        {
+            if (depth > 0 && prefix.Length > 0) topics.Add(prefix);
+            if (depth == 3) return;
+            foreach (var l in levels)
+                Build(depth == 0 ? l : prefix + "/" + l, depth + 1);
+        }
+        Build("", 0);
+
+        string[] filters = ["#", "+", "a", "a/#", "a/+", "+/#", "+/+", "a/b", "a/+/#", "+/b/#", "$x/#", "a//#", "+/+/+", "a/b/#", "/#", "+/"];
+        foreach (var filter in filters)
+        foreach (var topic in topics)
+            Assert.True(Matches(filter, topic) == TopicFilter.MatchesAny([filter], topic), $"filter '{filter}', topic '{topic}'");
+    }
+
+    [Theory]
+    [InlineData("msh/EU_868/2/e/+/!1a2b3c4d")]
+    [InlineData("msh/EU_868/2/e/#")]
+    [InlineData("msh/EU_868/2/e/a+b/!1a2b3c4d")]
+    [InlineData("")]
+    [InlineData(null)]
+    [InlineData("msh/\0/2/e")]
+    public void InvalidTopicNames_MatchNothing(string? topic)
+    {
+        Assert.False(TopicFilter.IsValidTopicName(topic, out var error));
+        Assert.NotNull(error);
+        Assert.False(TopicFilter.MatchesAny(["#"], topic));
+    }
+
+    [Fact]
+    public void EmptyAllowList_MatchesNothing() =>
+        Assert.False(TopicFilter.MatchesAny([], "msh/EU_868/2/e/SFNarrow/!1a2b3c4d"));
+
     /// <summary>Reference MQTT topic matcher (spec 4.7), used only to check Covers.</summary>
     static bool Matches(string filter, string topic)
     {

@@ -11,7 +11,8 @@ public sealed class DropCounters : IAsyncDisposable
 {
     public static readonly TimeSpan DefaultPeriod = TimeSpan.FromSeconds(60);
 
-    // Reasons come from PacketInspector, a small fixed set once numbers are collapsed, so the dictionary stays small.
+    // Reasons come from PacketInspector and the publish ACL, a small fixed set once numbers are collapsed, so the
+    // dictionary stays small.
     readonly ConcurrentDictionary<string, long> _counts = new(StringComparer.Ordinal);
     readonly ILogger _log;
     readonly CancellationTokenSource _stop = new();

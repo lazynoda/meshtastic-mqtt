@@ -23,7 +23,11 @@ static class TestSupport
         return port;
     }
 
-    /// <summary>meshdev (firmware default password) and alice (downlink on the lower-case `test` channel and on `Test`).</summary>
+    /// <summary>
+    /// meshdev (firmware default password) and alice (downlink on the lower-case `test` channel and on `Test`).
+    /// The phase-1 tests publish under msh/ES, so meshdev may publish there; the publish ACL itself is tested on the
+    /// production root msh/EU_868 in PublishAclTests.
+    /// </summary>
     public static BrokerConfig Config(int port, string extra = "") => ConfigLoader.Parse($"""
         listener:
           bind_address: 127.0.0.1
@@ -34,6 +38,7 @@ static class TestSupport
         users:
           - username: meshdev
             password_hash: "{AuthTests.MeshdevHash}"
+            publish_allow: [msh/ES/2/e/#]
           - username: alice
             password_hash: "{AuthTests.AliceHash}"
             subscribe_allow: [msh/ES/2/e/test/#, msh/ES/2/e/Test/#]
