@@ -78,9 +78,10 @@ static class Cli
         }
 
         var limits = config.Limits!;
-        logger.Information("Listening on {Address}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_undecryptable={DropUndecryptable}, drop_pki={DropPki}, max_packet_size={MaxPacketSize}, communication_timeout_seconds={CommunicationTimeout}",
+        logger.Information("Listening on {Address}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_undecryptable={DropUndecryptable}, drop_pki={DropPki}, max_packet_size={MaxPacketSize}, communication_timeout_seconds={CommunicationTimeout}, max_payload_size={MaxPayloadSize}, max_connections_per_ip={MaxConnectionsPerIp}, connect_rate_per_ip_per_minute={ConnectRatePerIp}",
             config.BindAddress, config.Listener.Port, config.Users!.Count, config.ChannelKeyMap.Count, config.DropUndecryptable, config.DropPki,
-            limits.MaxPacketSize, limits.CommunicationTimeoutSeconds);
+            limits.MaxPacketSize, limits.CommunicationTimeoutSeconds, limits.MaxPayloadSize, limits.MaxConnectionsPerIp,
+            limits.ConnectRatePerIpPerMinute);
 
         await stop.Task;
         logger.Information("Shutting down");

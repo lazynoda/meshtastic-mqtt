@@ -199,6 +199,17 @@ FIXTURES.update({
                                              "SFNarrow", "!deadbeef"),
 })
 
+# --- A flood of distinct packets (the dedupe memory test) ----------------------------------------------------
+# 200 channel packets that differ only in their packet id, so the broker sees 200 different (from, id)
+# pairs. Every envelope is preceded by its length as two big-endian bytes, so the test can split the file
+# without guessing the size of a message.
+FLOOD_COUNT = 200
+_flood = b""
+for _i in range(FLOOD_COUNT):
+    _env = encrypted_envelope("SFNarrow", "AQ==", 0x1A2B3C4D, 0x20000000 + _i, 1, b"flood-payload", "!1a2b3c4d")
+    _flood += len(_env).to_bytes(2, "big") + _env
+FIXTURES["flood_packets.bin"] = _flood
+
 if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
     for name, blob in FIXTURES.items():

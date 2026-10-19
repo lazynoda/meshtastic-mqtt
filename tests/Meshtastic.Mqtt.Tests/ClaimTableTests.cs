@@ -33,7 +33,9 @@ public sealed class ClaimTableTests : IAsyncLifetime
     public async ValueTask InitializeAsync()
     {
         var logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(_logs).CreateLogger();
-        _built = TestBroker.CreateBuilt(Config(_port), logger);
+        // The per-IP limits are off here: this suite opens hundreds of connections on purpose, and the
+        // default connection cap and connect rate would refuse them.
+        _built = TestBroker.CreateBuilt(Config(_port, PerIpLimitsOff), logger);
         await Server.StartAsync();
     }
 

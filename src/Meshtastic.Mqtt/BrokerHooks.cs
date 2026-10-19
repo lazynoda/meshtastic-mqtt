@@ -48,6 +48,13 @@ public sealed class BrokerHooks
     readonly Dictionary<string, IReadOnlyCollection<string>> _subscribeAllow = new(StringComparer.Ordinal);
     readonly Dictionary<string, IReadOnlyCollection<string>> _publishAllow = new(StringComparer.Ordinal);
 
+    // The limits of this phase: the payload cap, the per-client publish rate and the per-packet gate
+    // (cross-gateway dedupe and per-node packet rate).
+    readonly int _maxPayloadSize;
+    readonly ClientRateTable _publishRate;
+    readonly PacketGate _gate;
+    readonly bool _publishRateOn;
+
     // Client id -> user owning it, mirroring MQTTnet's session store. A claim is taken (pending) when a CONNECT
     // passes authentication, marked connected when MQTTnet reports the client connected, and removed when its
     // session is deleted.
@@ -78,7 +85,8 @@ public sealed class BrokerHooks
         public readonly long Sequence = Interlocked.Increment(ref _last);
     }
 
-    public BrokerHooks(BrokerConfig config, ILogger log, int? maxConcurrentKdf = null, DropCounters? drops = null)
+    public BrokerHooks(BrokerConfig config, ILogger log, int? maxConcurrentKdf = null, DropCounters? drops = null,
+        TimeProvider? time = null)
     {
         _log = log;
         var users = config.Users ?? [];
@@ -89,6 +97,18 @@ public sealed class BrokerHooks
             limits.AuthMaxPendingPerUser ?? LimitsConfig.DefaultAuthMaxPendingPerUser);
         _inspector = new PacketInspector(config);
         Drops = drops ?? new DropCounters(log, start: false);
+        _maxPayloadSize = limits.MaxPayloadSize ?? LimitsConfig.DefaultMaxPayloadSize;
+
+        var clock = time ?? TimeProvider.System;
+        var publishRate = limits.PublishRatePerClientPerMinute ?? LimitsConfig.DefaultPublishRatePerClientPerMinute;
+        var publishBurst = limits.PublishBurstPerClient ?? LimitsConfig.DefaultPublishBurstPerClient;
+        _publishRateOn = publishRate > 0 && publishBurst > 0;
+        _publishRate = new ClientRateTable(publishBurst, publishRate / 60.0, MaxTrackedClients,
+            TimeSpan.FromMinutes(10), clock, () => Drops.Increment(ClientRateTable.EvictionReason));
+        _gate = new PacketGate(limits, clock,
+            onDedupeEvicted: () => Drops.Increment(PacketGate.DedupeEvictionReason),
+            onRateEvicted: () => Drops.Increment(PacketGate.RateEvictionReason));
+
         foreach (var user in users)
         {
             _subscribeAllow[user.Username] = (user.SubscribeAllow ?? []).ToArray();
@@ -96,9 +116,18 @@ public sealed class BrokerHooks
         }
     }
 
+    /// <summary>How many clients the per-client publish rate table may track at once.</summary>
+    internal const int MaxTrackedClients = 100_000;
+
     internal DropCounters Drops { get; }
 
     internal Authenticator Authenticator => _authenticator;
+
+    /// <summary>The cross-gateway dedupe and the per-node packet rate (for tests).</summary>
+    internal PacketGate Gate => _gate;
+
+    /// <summary>The per-client publish rate table (for tests).</summary>
+    internal ClientRateTable PublishRate => _publishRate;
 
     /// <summary>Points session lookups at <paramref name="server"/> without subscribing to its events (for tests).</summary>
     internal void UseServerForLookups(MqttServer server) => _server = server;
@@ -364,6 +393,10 @@ public sealed class BrokerHooks
 
     internal Task OnSessionDeletedAsync(SessionDeletedEventArgs args)
     {
+        // The publish budget of a client dies with its session: a client id taken over later starts fresh.
+        if (!string.IsNullOrEmpty(args.Id))
+            _publishRate.Remove(args.Id);
+
         var token = args.SessionItems?[ClaimTokenKey] as ClaimToken;
         lock (_claims)
         {
@@ -495,23 +528,44 @@ public sealed class BrokerHooks
             {
                 // The client stays connected (firmware reconnects in a loop) and the refusal is Debug per packet plus
                 // the periodic summary: a node configured with the wrong root would otherwise flood the log.
-                args.ProcessPublish = false;
-                args.Response.ReasonCode = denyCode.Value;   // MQTT 5 PUBACK/PUBREC only; 3.1.1 acks carry no code
-                Drops.Increment(denyReason);
-                _log.Debug("Dropped publish on {Topic} from {ClientId} ({Username}): {Reason}",
-                    Trim(topic), Trim(args.ClientId), Trim(owner ?? args.UserName), denyReason);
+                DropPublish(args, denyCode.Value, denyReason, topic, owner, null);
                 return Task.CompletedTask;
             }
 
             var payload = message is null ? [] : message.Payload.ToArray();
+
+            // The payload cap, before anything is parsed: a payload the broker will never look at is dropped early.
+            if (payload.Length > _maxPayloadSize)
+            {
+                DropPublish(args, MqttPubAckReasonCode.QuotaExceeded, PayloadTooLargeReason, topic, owner, null);
+                return Task.CompletedTask;
+            }
+
+            // The per-client publish rate, before the packet is inspected: a client that floods is cut even
+            // if its packets are garbage.
+            if (_publishRateOn && !_publishRate.TryTake(owner ?? string.Empty, args.ClientId))
+            {
+                DropPublish(args, MqttPubAckReasonCode.QuotaExceeded, PublishRateReason, topic, owner, null);
+                return Task.CompletedTask;
+            }
+
             var result = _inspector.Inspect(topic, payload);
 
             if (!result.Accepted)
             {
-                args.ProcessPublish = false;
-                Drops.Increment(result.Reason);
-                _log.Debug("Dropped publish on {Topic} from {ClientId}: {Reason} (from {From}, id {PacketId})",
-                    Trim(topic), Trim(args.ClientId), result.Reason, NodeId(result.From), result.PacketId);
+                DropPublish(args, null, result.Reason, topic, owner, result);
+                return Task.CompletedTask;
+            }
+
+            // The cross-gateway dedupe and the per-node packet rate. A map report carries no id, so it is not
+            // deduplicated, but it is charged as one packet of its node.
+            var verdict = result.PacketId == 0
+                ? _gate.EvaluateMapReport(result.From)
+                : _gate.EvaluatePacket(result.From, result.PacketId, result.Gateway ?? string.Empty);
+            if (verdict != PacketGate.Verdict.Accept)
+            {
+                DropPublish(args, verdict == PacketGate.Verdict.RateExceeded ? MqttPubAckReasonCode.QuotaExceeded : null,
+                    GateReason(verdict), topic, owner, result);
                 return Task.CompletedTask;
             }
 
@@ -536,12 +590,47 @@ public sealed class BrokerHooks
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Drops one publish: it is not forwarded, it is counted under its own reason and logged at Debug per
+    /// packet. The client is never disconnected.
+    /// </summary>
+    void DropPublish(InterceptingPublishEventArgs args, MqttPubAckReasonCode? code, string reason, string? topic,
+        string? owner, Inspection? result)
+    {
+        args.ProcessPublish = false;
+        if (code is not null)
+            args.Response.ReasonCode = code.Value;   // MQTT 5 PUBACK/PUBREC only; 3.1.1 acks carry no code
+        Drops.Increment(reason);
+        if (result is null)
+            _log.Debug("Dropped publish on {Topic} from {ClientId} ({Username}): {Reason}",
+                Trim(topic), Trim(args.ClientId), Trim(owner ?? args.UserName), reason);
+        else
+            _log.Debug("Dropped publish on {Topic} from {ClientId}: {Reason} (from {From}, id {PacketId})",
+                Trim(topic), Trim(args.ClientId), reason, NodeId(result.From), result.PacketId);
+    }
+
     static string NodeId(uint node) => $"!{node:x8}";
 
     /// <summary>Drop reasons of the publish ACL, as counted in <see cref="Drops"/>.</summary>
     internal const string InvalidTopicNameReason = "invalid topic name";
     internal const string NoOwnerReason = "publish without a session owner";
     internal const string NotInPublishAllowReason = "not in publish_allow";
+
+    /// <summary>Drop reasons of the limits and the dedupe, as counted in <see cref="Drops"/>.</summary>
+    internal const string PayloadTooLargeReason = "payload larger than max_payload_size";
+    internal const string PublishRateReason = "publish rate exceeded for the client";
+    internal const string DuplicateGatewayReason = "duplicate from the same gateway";
+    internal const string TooManyGatewaysReason = "too many gateways for one packet";
+    internal const string PacketRateReason = "packet rate exceeded for the node";
+
+    /// <summary>The drop reason of a verdict of the packet gate.</summary>
+    static string GateReason(PacketGate.Verdict verdict) => verdict switch
+    {
+        PacketGate.Verdict.DuplicateFromSameGateway => DuplicateGatewayReason,
+        PacketGate.Verdict.TooManyGateways => TooManyGatewaysReason,
+        PacketGate.Verdict.RateExceeded => PacketRateReason,
+        _ => "internal error",
+    };
 
     /// <summary>Null code = allowed; otherwise the PUBACK reason code (MQTT 5) and the drop reason.</summary>
     internal (MqttPubAckReasonCode? Code, string Reason) EvaluatePublish(string? owner, string? topic)

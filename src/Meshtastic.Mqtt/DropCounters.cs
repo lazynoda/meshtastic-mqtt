@@ -32,6 +32,15 @@ public sealed class DropCounters : IAsyncDisposable
         _counts.AddOrUpdate(key, 1, (_, n) => n + 1);
     }
 
+    /// <summary>The counts as they are now, without flushing them (for tests).</summary>
+    public IReadOnlyDictionary<string, long> Snapshot()
+    {
+        var copy = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var (reason, n) in _counts)
+            copy[reason] = n;
+        return copy;
+    }
+
     static readonly System.Text.RegularExpressions.Regex Digits = new("[0-9]+", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     /// <summary>Logs and resets the counters; logs nothing when nothing was dropped.</summary>

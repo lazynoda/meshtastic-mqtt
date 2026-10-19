@@ -22,7 +22,9 @@ public sealed class AuthQueueTests : IAsyncLifetime
     public async ValueTask InitializeAsync()
     {
         var logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(_logs).CreateLogger();
-        _server = TestBroker.Create(Config(_port), logger, maxConcurrentKdf: 1);
+        // The per-IP limits are off here: this suite is about the password queue, and the default
+        // connection cap and connect rate would refuse the connections the flood needs.
+        _server = TestBroker.Create(Config(_port, PerIpLimitsOff), logger, maxConcurrentKdf: 1);
         await _server.StartAsync();
     }
 

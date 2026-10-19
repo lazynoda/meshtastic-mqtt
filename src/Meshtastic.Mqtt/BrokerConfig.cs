@@ -179,6 +179,42 @@ public sealed class LimitsConfig
     public const int DefaultAuthMaxPending = 64;
     public const int DefaultAuthMaxPendingPerUser = 4;
 
+    /// <summary>Connections one address may hold at once (0 = off).</summary>
+    public const int DefaultMaxConnectionsPerIp = 16;
+
+    /// <summary>Connections one address may open per minute (0 = off).</summary>
+    public const int DefaultConnectRatePerIpPerMinute = 30;
+
+    /// <summary>Burst of the per-address connect rate (0 = off).</summary>
+    public const int DefaultConnectBurstPerIp = 10;
+
+    /// <summary>Largest publish payload accepted, in bytes.</summary>
+    public const int DefaultMaxPayloadSize = 512;
+
+    /// <summary>Smallest publish payload cap that may be configured.</summary>
+    public const int MinMaxPayloadSize = 64;
+
+    /// <summary>Publishes one client may send per minute (0 = off).</summary>
+    public const int DefaultPublishRatePerClientPerMinute = 120;
+
+    /// <summary>Burst of the per-client publish rate (0 = off).</summary>
+    public const int DefaultPublishBurstPerClient = 60;
+
+    /// <summary>How long a packet is remembered for the cross-gateway dedupe, in seconds (0 = off).</summary>
+    public const int DefaultDedupeWindowSeconds = 120;
+
+    /// <summary>How many gateways may send the same packet before the copies are dropped.</summary>
+    public const int DefaultDedupeMaxGatewaysPerPacket = 32;
+
+    /// <summary>How many packets are remembered for the dedupe at once.</summary>
+    public const int DefaultDedupeMaxEntries = 200_000;
+
+    /// <summary>Packets one node may send per minute (0 = off).</summary>
+    public const int DefaultPacketRatePerFromPerMinute = 30;
+
+    /// <summary>Burst of the per-node packet rate (0 = off).</summary>
+    public const int DefaultPacketBurstPerFrom = 15;
+
     /// <summary>
     /// Largest MQTT packet accepted, counted as the fixed header's Remaining Length. Enforced while the header is
     /// read, before MQTTnet allocates the body, so it also bounds unauthenticated CONNECTs.
@@ -200,6 +236,68 @@ public sealed class LimitsConfig
     /// </summary>
     public int? AuthMaxPendingPerUser { get; set; } = DefaultAuthMaxPendingPerUser;
 
+    /// <summary>
+    /// Connections one IP address may hold open at once. Enforced when the connection is accepted, before
+    /// any MQTT byte is read. 0 turns the cap off.
+    /// </summary>
+    public int? MaxConnectionsPerIp { get; set; } = DefaultMaxConnectionsPerIp;
+
+    /// <summary>
+    /// Connections one IP address may open per minute (token bucket, see <see cref="ConnectBurstPerIp"/>).
+    /// Enforced when the connection is accepted. 0 turns the rate off.
+    /// </summary>
+    public int? ConnectRatePerIpPerMinute { get; set; } = DefaultConnectRatePerIpPerMinute;
+
+    /// <summary>
+    /// Burst of the per-IP connect rate: how many connections one address may open at once. 0 turns the
+    /// rate off.
+    /// </summary>
+    public int? ConnectBurstPerIp { get; set; } = DefaultConnectBurstPerIp;
+
+    /// <summary>
+    /// Largest publish payload accepted, in bytes. Checked in the publish hook, before the packet is
+    /// parsed. Cannot be larger than <see cref="MaxPacketSize"/>.
+    /// </summary>
+    public int? MaxPayloadSize { get; set; } = DefaultMaxPayloadSize;
+
+    /// <summary>
+    /// Publishes one client (session owner and client id) may send per minute (token bucket, see
+    /// <see cref="PublishBurstPerClient"/>). 0 turns the rate off.
+    /// </summary>
+    public int? PublishRatePerClientPerMinute { get; set; } = DefaultPublishRatePerClientPerMinute;
+
+    /// <summary>
+    /// Burst of the per-client publish rate: how many publishes one client may send at once. 0 turns the
+    /// rate off.
+    /// </summary>
+    public int? PublishBurstPerClient { get; set; } = DefaultPublishBurstPerClient;
+
+    /// <summary>
+    /// How long a packet is remembered for the cross-gateway dedupe, in seconds. 0 turns the dedupe off.
+    /// </summary>
+    public int? DedupeWindowSeconds { get; set; } = DefaultDedupeWindowSeconds;
+
+    /// <summary>
+    /// How many gateways may send the same packet before the further copies are dropped.
+    /// </summary>
+    public int? DedupeMaxGatewaysPerPacket { get; set; } = DefaultDedupeMaxGatewaysPerPacket;
+
+    /// <summary>
+    /// How many packets are remembered for the dedupe at once; the oldest are evicted when the cap is hit.
+    /// </summary>
+    public int? DedupeMaxEntries { get; set; } = DefaultDedupeMaxEntries;
+
+    /// <summary>
+    /// Packets one node (the packet's <c>from</c>) may send per minute (token bucket, see
+    /// <see cref="PacketBurstPerFrom"/>). 0 turns the rate off.
+    /// </summary>
+    public int? PacketRatePerFromPerMinute { get; set; } = DefaultPacketRatePerFromPerMinute;
+
+    /// <summary>
+    /// Burst of the per-node packet rate: how many packets one node may send at once. 0 turns the rate off.
+    /// </summary>
+    public int? PacketBurstPerFrom { get; set; } = DefaultPacketBurstPerFrom;
+
     internal void Validate(List<string> errors)
     {
         Check(errors, "max_packet_size", MaxPacketSize, MinMaxPacketSize, MaxMaxPacketSize);
@@ -207,6 +305,24 @@ public sealed class LimitsConfig
         Check(errors, "auth_queue_timeout_seconds", AuthQueueTimeoutSeconds, 1, 60);
         Check(errors, "auth_max_pending", AuthMaxPending, 1, 100_000);
         Check(errors, "auth_max_pending_per_user", AuthMaxPendingPerUser, 1, 100_000);
+
+        Check(errors, "max_connections_per_ip", MaxConnectionsPerIp, 0, 100_000);
+        Check(errors, "connect_rate_per_ip_per_minute", ConnectRatePerIpPerMinute, 0, 1_000_000);
+        Check(errors, "connect_burst_per_ip", ConnectBurstPerIp, 0, 1_000_000);
+        Check(errors, "publish_rate_per_client_per_minute", PublishRatePerClientPerMinute, 0, 1_000_000);
+        Check(errors, "publish_burst_per_client", PublishBurstPerClient, 0, 1_000_000);
+        Check(errors, "dedupe_window_seconds", DedupeWindowSeconds, 0, 86_400);
+        Check(errors, "dedupe_max_gateways_per_packet", DedupeMaxGatewaysPerPacket, 1, 100_000);
+        Check(errors, "dedupe_max_entries", DedupeMaxEntries, 1, 10_000_000);
+        Check(errors, "packet_rate_per_from_per_minute", PacketRatePerFromPerMinute, 0, 1_000_000);
+        Check(errors, "packet_burst_per_from", PacketBurstPerFrom, 0, 1_000_000);
+
+        // The payload cap can never be larger than the packet the broker is willing to read.
+        var maxPacket = MaxPacketSize is >= MinMaxPacketSize and <= MaxMaxPacketSize
+            ? MaxPacketSize.Value
+            : DefaultMaxPacketSize;
+        if (MaxPayloadSize is null || MaxPayloadSize < MinMaxPayloadSize || MaxPayloadSize > maxPacket)
+            errors.Add($"limits.max_payload_size: {(MaxPayloadSize is null ? "empty value" : MaxPayloadSize.ToString())} is not an integer between {MinMaxPayloadSize} and {maxPacket}");
     }
 
     static void Check(List<string> errors, string key, int? value, int min, int max)

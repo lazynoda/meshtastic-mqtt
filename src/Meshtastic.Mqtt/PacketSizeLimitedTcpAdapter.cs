@@ -22,13 +22,22 @@ namespace Meshtastic.Mqtt;
 /// the same plumbing (socket, <see cref="MqttTcpChannel"/>, <see cref="MqttChannelAdapter"/>) plus a channel
 /// decorator that watches the byte stream and ends the connection as soon as a declared length exceeds the
 /// limit. The adapter only serves the plain endpoint; TLS is not offered by this broker.
+/// <para>
+/// The adapter is also where the per-IP limits live (see <see cref="ConnectionGuard"/>): they are applied when
+/// the connection is accepted, before a single MQTT byte is read, so a flood of sockets or of CONNECTs is cut
+/// before it reaches the broker.
+/// </para>
 /// </remarks>
-public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPacketSize, ILogger log) : IMqttServerAdapter
+public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPacketSize, ILogger log,
+    ConnectionGuard? guard = null, DropCounters? drops = null) : IMqttServerAdapter
 {
     Socket? _listener;
     CancellationTokenSource? _cts;
     MqttServerOptions? _options;
     IMqttNetLogger? _mqttLogger;
+
+    /// <summary>The per-IP limits applied on accept (never null).</summary>
+    internal ConnectionGuard Guard { get; } = guard ?? new ConnectionGuard(new LimitsConfig(), TimeProvider.System);
 
     public Func<IMqttChannelAdapter, Task>? ClientHandler { get; set; }
 
@@ -130,11 +139,50 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
                 }
                 continue;
             }
-            _ = Task.Run(() => HandleClientAsync(client), CancellationToken.None);
+
+            // The per-IP limits, before a single MQTT byte is read. A refused connection is closed at once.
+            var remoteIp = (client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "unknown";
+            if (!Guard.TryAcquire(remoteIp, out var refusal))
+            {
+                drops?.Increment(refusal!);
+                // Debug per refusal: an address that floods must not be able to flood the log. The refusals
+                // are counted in the same summary as the dropped publishes.
+                log.Debug("Connection refused from {RemoteIp}: {Reason}", remoteIp, refusal);
+                try
+                {
+                    // A clean close, so the client sees the end of the stream instead of a reset.
+                    client.Shutdown(SocketShutdown.Send);
+                }
+                catch (Exception ex)
+                {
+                    log.Debug("Error closing a refused TCP connection: {Error}", ex.GetType().Name);
+                }
+                try
+                {
+                    client.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    log.Error("Error closing a refused TCP connection: {Error}", ex.GetType().Name);
+                }
+                continue;
+            }
+
+            try
+            {
+                _ = Task.Run(() => HandleClientAsync(client, remoteIp), CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                // The handler never started: give the slot back, or the counter would leak.
+                Guard.Release(remoteIp);
+                client.Dispose();
+                log.Error("Error starting a TCP connection handler: {Error}", ex.GetType().Name);
+            }
         }
     }
 
-    async Task HandleClientAsync(Socket client)
+    async Task HandleClientAsync(Socket client, string remoteIp)
     {
         NetworkStream? stream = null;
         try
@@ -149,18 +197,18 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
             if (handler is null)
                 return;
 
-            var remoteIp = (remote as IPEndPoint)?.Address.ToString() ?? "unknown";
+            var remoteIpLocal = (remote as IPEndPoint)?.Address.ToString() ?? "unknown";
             var channel = new PacketSizeGuardChannel(new MqttTcpChannel(stream, local, remote, null), maxPacketSize, (reason, declared) =>
             {
                 if (reason == PacketSizeGuardChannel.TripReason.Oversized)
                 {
                     log.Warning("Connection closed: packet length {Length} exceeds limits.max_packet_size {MaxPacketSize} from {RemoteIp}",
-                        declared, maxPacketSize, remoteIp);
+                        declared, maxPacketSize, remoteIpLocal);
                 }
                 else
                 {
                     // The partial value is meaningless here (more than 4 length bytes), so it is not logged.
-                    log.Warning("Connection closed: malformed Remaining Length (more than 4 bytes) from {RemoteIp}", remoteIp);
+                    log.Warning("Connection closed: malformed Remaining Length (more than 4 bytes) from {RemoteIp}", remoteIpLocal);
                 }
             });
             var formatter = new MqttPacketFormatterAdapter(new MqttBufferWriter(options.WriterBufferSize, options.WriterBufferSizeMax));
@@ -186,6 +234,8 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
         }
         finally
         {
+            // The per-IP slot is given back on every close path, so the counter never leaks.
+            Guard.Release(remoteIp);
             try
             {
                 if (stream is not null)

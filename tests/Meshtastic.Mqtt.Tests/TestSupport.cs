@@ -14,6 +14,13 @@ static class TestSupport
 {
     public const string AlicePassword = "correct-horse";
 
+    /// <summary>
+    /// The per-IP limits, turned off. The tests that open many connections at once (the password-queue
+    /// tests, the claim-table tests) are not about these limits, and the default values would refuse
+    /// connections they need.
+    /// </summary>
+    public const string PerIpLimitsOff = "limits:\n  max_connections_per_ip: 0\n  connect_rate_per_ip_per_minute: 0";
+
     public static int FreePort()
     {
         var l = new TcpListener(IPAddress.Loopback, 0);
@@ -73,6 +80,23 @@ static class TestSupport
         public ConcurrentQueue<LogEvent> Events { get; } = new();
         public void Emit(LogEvent logEvent) => Events.Enqueue(logEvent);
     }
+}
+
+/// <summary>
+/// A monotonic clock the tests drive by hand: the rate limits never sleep, they only read the clock.
+/// </summary>
+public sealed class FakeClock : TimeProvider
+{
+    long _ticks;
+
+    public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+    public override long GetTimestamp() => _ticks;
+
+    public override DateTimeOffset GetUtcNow() => new(_ticks, TimeSpan.Zero);
+
+    /// <summary>Moves the clock forward.</summary>
+    public void Advance(TimeSpan by) => _ticks += (long)(by.Ticks * TimestampFrequency / TimeSpan.TicksPerSecond);
 }
 
 /// <summary>Timing- and memory-sensitive tests run alone, after the parallel ones.</summary>

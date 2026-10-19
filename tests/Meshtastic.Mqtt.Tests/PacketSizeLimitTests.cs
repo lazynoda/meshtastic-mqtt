@@ -24,7 +24,9 @@ public sealed class PacketSizeLimitTests : IAsyncLifetime
     public async ValueTask InitializeAsync()
     {
         var logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(_logs).CreateLogger();
-        _server = TestBroker.Create(Config(_port), logger);
+        // The publish payload cap is raised to the packet size: this suite is about limits.max_packet_size,
+        // and a payload over the (much smaller) payload cap would be refused before the size guard sees it.
+        _server = TestBroker.Create(Config(_port, "limits:\n  max_payload_size: 4096"), logger);
         await _server.StartAsync();
     }
 

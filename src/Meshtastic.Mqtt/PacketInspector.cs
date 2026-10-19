@@ -11,7 +11,8 @@ public sealed record Inspection(
     uint From = 0,
     uint PacketId = 0,
     PortNum? Portnum = null,
-    bool? ChannelHashMatches = null);
+    bool? ChannelHashMatches = null,
+    string? Gateway = null);
 
 /// <summary>
 /// Decides whether a published message may reach subscribers. Pure logic on (topic, payload):
@@ -43,7 +44,7 @@ public sealed class PacketInspector(BrokerConfig config)
             return Drop("empty payload");
         if (IsMapReportTopic(topic))
             return InspectMapReport(payload);
-        if (!TryParseTopic(topic, out var topicChannel))
+        if (!TryParseTopic(topic, out var topicChannel, out var topicGateway))
         {
             return HasMapLevels(topic)
                 ? Drop("unsupported map topic (expected <root>/2/map/)")
@@ -75,9 +76,11 @@ public sealed class PacketInspector(BrokerConfig config)
             return Drop($"encrypted payload size {packet.Encrypted.Length} outside 1-{PacketCrypto.MaxEncryptedBytes}", channel, packet);
         if (!string.Equals(channel, topicChannel, StringComparison.Ordinal))
             return Drop("channel_id does not match the topic", channel, packet);
+        if (!GatewayMatchesTopic(topicGateway, envelope.GatewayId))
+            return Drop(GatewayMismatchReason, channel, packet);
 
         if (channel == PkiChannel)
-            return InspectPki(packet);
+            return InspectPki(packet, topicGateway);
 
         var key = config.ChannelKeyMap.TryGetValue(channel, out var configured) ? configured : config.DefaultKey;
         var hashMatches = ChannelKeys.ChannelHash(channel, key) == packet.Channel;
@@ -86,19 +89,19 @@ public sealed class PacketInspector(BrokerConfig config)
         {
             return config.DropUndecryptable
                 ? Drop("undecryptable with the key configured for this channel", channel, packet, hashMatches)
-                : new Inspection(true, "undecryptable, passed (drop_undecryptable: false)", channel, packet.From, packet.Id, null, hashMatches);
+                : new Inspection(true, "undecryptable, passed (drop_undecryptable: false)", channel, packet.From, packet.Id, null, hashMatches, topicGateway);
         }
-        return new Inspection(true, "decrypted", channel, packet.From, packet.Id, data.Portnum, hashMatches);
+        return new Inspection(true, "decrypted", channel, packet.From, packet.Id, data.Portnum, hashMatches, topicGateway);
     }
 
-    Inspection InspectPki(MeshPacket packet)
+    Inspection InspectPki(MeshPacket packet, string gateway)
     {
         // Firmware only produces PKI packets as unicast, with channel hash 0 and the CCM overhead appended.
         if (packet.To == 0 || packet.To == uint.MaxValue || packet.Channel != 0 || packet.Encrypted.Length <= PkiOverhead)
             return Drop("malformed PKI packet", PkiChannel, packet);
         return config.DropPki
             ? Drop("PKI DM (drop_pki: true)", PkiChannel, packet)
-            : new Inspection(true, "PKI DM passed through opaquely (drop_pki: false)", PkiChannel, packet.From, packet.Id);
+            : new Inspection(true, "PKI DM passed through opaquely (drop_pki: false)", PkiChannel, packet.From, packet.Id, null, null, gateway);
     }
 
     /// <summary>
@@ -144,7 +147,7 @@ public sealed class PacketInspector(BrokerConfig config)
         if (!string.Equals(envelope.GatewayId, $"!{packet.From:x8}", StringComparison.Ordinal))
             return Drop("map report: gateway_id is not the sender (from)", packet: packet);
 
-        return new Inspection(true, "map report", null, packet.From, packet.Id, PortNum.MapReportApp);
+        return new Inspection(true, "map report", null, packet.From, packet.Id, PortNum.MapReportApp, null, envelope.GatewayId);
     }
 
     /// <summary>
@@ -192,9 +195,16 @@ public sealed class PacketInspector(BrokerConfig config)
     }
 
     /// <summary>Accepts <c>&lt;root&gt;/2/e/&lt;channel&gt;/&lt;gateway&gt;</c>, root being one or more levels.</summary>
-    public static bool TryParseTopic(string? topic, out string channel)
+    public static bool TryParseTopic(string? topic, out string channel) => TryParseTopic(topic, out channel, out _);
+
+    /// <summary>
+    /// Accepts <c>&lt;root&gt;/2/e/&lt;channel&gt;/&lt;gateway&gt;</c>, root being one or more levels, and reports
+    /// the channel and the gateway level of the topic.
+    /// </summary>
+    public static bool TryParseTopic(string? topic, out string channel, out string gateway)
     {
         channel = string.Empty;
+        gateway = string.Empty;
         if (string.IsNullOrEmpty(topic))
             return false;
         var levels = topic.Split('/');
@@ -204,6 +214,45 @@ public sealed class PacketInspector(BrokerConfig config)
         if (levels.Take(n - 4).Any(string.IsNullOrEmpty) || levels[n - 2].Length == 0 || levels[n - 1].Length == 0)
             return false;
         channel = levels[n - 2];
+        gateway = levels[n - 1];
+        return true;
+    }
+
+    /// <summary>
+    /// Drop reason of a topic whose gateway level does not match the envelope's gateway id.
+    /// </summary>
+    public const string GatewayMismatchReason = "gateway in topic does not match gateway_id";
+
+    /// <summary>
+    /// Whether the gateway level of the topic is the gateway the envelope claims.
+    /// </summary>
+    /// <remarks>
+    /// The firmware builds the topic from the same string it puts in the envelope
+    /// (<c>src/mqtt/MQTT.cpp</c> <c>onSend()</c>: <c>nodeId</c> is both the topic's last level and
+    /// <c>gateway_id</c>), and <c>NodeDB::getNodeId()</c> writes it as <c>"!"</c> + 8 lowercase hex digits.
+    /// A topic whose gateway is anything else (a different id, upper case, no <c>!</c>, or a zero-width
+    /// character glued to it) is not a gateway the firmware would have published.
+    /// </remarks>
+    public static bool GatewayMatchesTopic(string? topicGateway, string? envelopeGateway)
+    {
+        if (string.IsNullOrEmpty(topicGateway) || !string.Equals(topicGateway, envelopeGateway, StringComparison.Ordinal))
+            return false;
+        return IsGatewayId(topicGateway);
+    }
+
+    /// <summary>
+    /// Whether the string is a node id as the firmware writes it: <c>!</c> followed by 8 lowercase hex digits.
+    /// </summary>
+    public static bool IsGatewayId(string? gateway)
+    {
+        if (gateway is null || gateway.Length != 9 || gateway[0] != '!')
+            return false;
+        for (var i = 1; i < gateway.Length; i++)
+        {
+            var c = gateway[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                return false;
+        }
         return true;
     }
 
