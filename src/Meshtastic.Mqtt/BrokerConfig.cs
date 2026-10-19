@@ -215,6 +215,15 @@ public sealed class LimitsConfig
     /// <summary>Burst of the per-node packet rate (0 = off).</summary>
     public const int DefaultPacketBurstPerFrom = 15;
 
+    /// <summary>Failed logins one IP address may make before it is banned (0 = off).</summary>
+    public const int DefaultAuthFailMaxPerIp = 10;
+
+    /// <summary>How long the failed logins of one IP address are counted, in seconds.</summary>
+    public const int DefaultAuthFailWindowSeconds = 600;
+
+    /// <summary>How long a banned IP address is refused, in seconds.</summary>
+    public const int DefaultAuthBanSeconds = 3600;
+
     /// <summary>
     /// Largest MQTT packet accepted, counted as the fixed header's Remaining Length. Enforced while the header is
     /// read, before MQTTnet allocates the body, so it also bounds unauthenticated CONNECTs.
@@ -298,6 +307,29 @@ public sealed class LimitsConfig
     /// </summary>
     public int? PacketBurstPerFrom { get; set; } = DefaultPacketBurstPerFrom;
 
+    /// <summary>
+    /// Failed logins one IP address may make before it is banned. Only a wrong password (or an unknown
+    /// user, or an unsupported authentication method) counts. 0 turns the bans off.
+    /// </summary>
+    public int? AuthFailMaxPerIp { get; set; } = DefaultAuthFailMaxPerIp;
+
+    /// <summary>
+    /// How long the failed logins of one IP address are counted, in seconds. The window starts with the
+    /// first failure; when it has passed, the next failure starts a new one.
+    /// </summary>
+    public int? AuthFailWindowSeconds { get; set; } = DefaultAuthFailWindowSeconds;
+
+    /// <summary>
+    /// How long a banned IP address is refused, in seconds. The ban is in memory only: a restart forgets it.
+    /// </summary>
+    public int? AuthBanSeconds { get; set; } = DefaultAuthBanSeconds;
+
+    /// <summary>
+    /// IP ranges (CIDR, IPv4 or IPv6) whose failed logins are never counted and which are never banned.
+    /// Empty by default.
+    /// </summary>
+    public List<string>? AuthBanExempt { get; set; } = new();
+
     internal void Validate(List<string> errors)
     {
         Check(errors, "max_packet_size", MaxPacketSize, MinMaxPacketSize, MaxMaxPacketSize);
@@ -316,6 +348,17 @@ public sealed class LimitsConfig
         Check(errors, "dedupe_max_entries", DedupeMaxEntries, 1, 10_000_000);
         Check(errors, "packet_rate_per_from_per_minute", PacketRatePerFromPerMinute, 0, 1_000_000);
         Check(errors, "packet_burst_per_from", PacketBurstPerFrom, 0, 1_000_000);
+
+        Check(errors, "auth_fail_max_per_ip", AuthFailMaxPerIp, 0, 100_000);
+        Check(errors, "auth_fail_window_seconds", AuthFailWindowSeconds, 10, 86_400);
+        Check(errors, "auth_ban_seconds", AuthBanSeconds, 60, 604_800);
+
+        // The exempt ranges: an invalid one is a typo the operator must see at startup.
+        foreach (var range in AuthBanExempt ?? [])
+        {
+            if (!IpCidr.TryParse(range, out _, out var rangeError))
+                errors.Add($"limits.auth_ban_exempt: {rangeError}");
+        }
 
         // The payload cap can never be larger than the packet the broker is willing to read.
         var maxPacket = MaxPacketSize is >= MinMaxPacketSize and <= MaxMaxPacketSize

@@ -343,8 +343,9 @@ public sealed class LimitNetworkTests
     {
         // The flood comes from 127.0.0.1 with the public credentials; the cold login comes from 127.0.0.2
         // (another loopback address). The per-IP connect rate cuts the flood at the accept, before it can
-        // fill the password-hashing queue of the real meshdev user.
-        var limits = "limits:\n  max_connections_per_ip: 0\n  connect_rate_per_ip_per_minute: 30\n  connect_burst_per_ip: 10";
+        // fill the password-hashing queue of the real meshdev user. The bans of phase 4 are off here: this
+        // test is about the connect rate, and a ban would cut the flood for another reason.
+        var limits = "limits:\n  max_connections_per_ip: 0\n  connect_rate_per_ip_per_minute: 30\n  connect_burst_per_ip: 10\n  auth_fail_max_per_ip: 0";
         await Run(limits, async (_, _, logs) =>
         {
             using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);

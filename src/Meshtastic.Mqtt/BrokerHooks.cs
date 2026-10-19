@@ -17,6 +17,7 @@ namespace Meshtastic.Mqtt;
 /// Log levels: authentication failures and refused connections are Warning, one line per attempt with
 /// username and IP (fail2ban reads them). A refused SUBSCRIBE is one Warning per packet. Dropped publishes are
 /// Debug per packet, plus an Information summary per drop reason every 60 s (see <see cref="DropCounters"/>).
+/// The ban of an address is one Warning when it starts; the connections of a banned address are Debug.
 /// </remarks>
 public sealed class BrokerHooks
 {
@@ -44,6 +45,7 @@ public sealed class BrokerHooks
 
     readonly ILogger _log;
     readonly Authenticator _authenticator;
+    readonly AuthBanManager _bans;
     readonly PacketInspector _inspector;
     readonly Dictionary<string, IReadOnlyCollection<string>> _subscribeAllow = new(StringComparer.Ordinal);
     readonly Dictionary<string, IReadOnlyCollection<string>> _publishAllow = new(StringComparer.Ordinal);
@@ -86,7 +88,7 @@ public sealed class BrokerHooks
     }
 
     public BrokerHooks(BrokerConfig config, ILogger log, int? maxConcurrentKdf = null, DropCounters? drops = null,
-        TimeProvider? time = null)
+        TimeProvider? time = null, AuthBanManager? bans = null)
     {
         _log = log;
         var users = config.Users ?? [];
@@ -100,6 +102,11 @@ public sealed class BrokerHooks
         _maxPayloadSize = limits.MaxPayloadSize ?? LimitsConfig.DefaultMaxPayloadSize;
 
         var clock = time ?? TimeProvider.System;
+        // The bans of this phase: the failed logins per IP address and the ban they cause. The listener
+        // shares this instance, so a connection is refused at the accept and at the CONNECT alike.
+        _bans = bans ?? new AuthBanManager(limits, clock, log,
+            onFailureEvicted: () => Drops.Increment(AuthBanManager.FailureTableEvictionReason),
+            onBanEvicted: () => Drops.Increment(AuthBanManager.BanTableEvictionReason));
         var publishRate = limits.PublishRatePerClientPerMinute ?? LimitsConfig.DefaultPublishRatePerClientPerMinute;
         var publishBurst = limits.PublishBurstPerClient ?? LimitsConfig.DefaultPublishBurstPerClient;
         _publishRateOn = publishRate > 0 && publishBurst > 0;
@@ -122,6 +129,9 @@ public sealed class BrokerHooks
     internal DropCounters Drops { get; }
 
     internal Authenticator Authenticator => _authenticator;
+
+    /// <summary>The failed logins per IP address and the bans they cause (for tests).</summary>
+    internal AuthBanManager Bans => _bans;
 
     /// <summary>The cross-gateway dedupe and the per-node packet rate (for tests).</summary>
     internal PacketGate Gate => _gate;
@@ -150,6 +160,16 @@ public sealed class BrokerHooks
         {
             remoteIp = (args.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? args.RemoteEndPoint?.ToString() ?? "unknown";
 
+            // A banned address is refused before any password is checked: the ban is cheaper than PBKDF2.
+            // The refusal is not a new failure (the address is already banned) and it is logged at Debug
+            // only: a banned address may keep trying, and a Warning per attempt would flood the log.
+            if (_bans.IsBanned(remoteIp))
+            {
+                args.ReasonCode = MqttConnectReasonCode.Banned;
+                _log.Debug("Connection refused: {RemoteIp} is banned", remoteIp);
+                return;
+            }
+
             // MQTT 5 requires the server to accept an empty client id and assign one (3.1.1 lets the server
             // refuse it, and MQTTnet does). Assign it up front so a bad password still reports as such.
             if (string.IsNullOrEmpty(args.ClientId) && args.ProtocolVersion == MqttProtocolVersion.V500)
@@ -159,6 +179,7 @@ public sealed class BrokerHooks
                 args.ReasonCode = MqttConnectReasonCode.BadAuthenticationMethod;
                 _log.Warning("Connection refused: unsupported authentication method {AuthMethod} for user {Username} from {RemoteIp}",
                     Trim(args.AuthenticationMethod), Trim(args.UserName), remoteIp);
+                _bans.RecordFailure(remoteIp, MqttConnectReasonCode.BadAuthenticationMethod);
                 return;
             }
 
@@ -178,6 +199,8 @@ public sealed class BrokerHooks
                 args.ReasonCode = MqttConnectReasonCode.BadUserNameOrPassword;
                 _log.Warning("Authentication failed for user {Username} from {RemoteIp} (client {ClientId})",
                     Trim(args.UserName), remoteIp, Trim(args.ClientId));
+                // A wrong password (or an unknown user) is the failure the ban is built on.
+                _bans.RecordFailure(remoteIp, MqttConnectReasonCode.BadUserNameOrPassword);
                 return;
             }
 

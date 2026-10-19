@@ -81,6 +81,26 @@ limits:
   packet_rate_per_from_per_minute: 30
   # Burst of the per-node packet rate: how many packets one node may send at once. 0 turns it off.
   packet_burst_per_from: 15
+  # Failed logins one IP address may make before it is banned. Only a wrong password (or an unknown user,
+  # or an unsupported authentication method) counts: a full password queue, a client-id conflict and a
+  # connection refused at the accept do not. The failures are counted in the window below; the one that
+  # reaches this limit bans the address for auth_ban_seconds. 0 turns the bans off. Range 0-100000.
+  auth_fail_max_per_ip: 10
+  # How long the failed logins of one IP address are counted, in seconds. The window starts with the first
+  # failure; when it has passed, the next failure starts a new one. A successful login does not reset the
+  # counter (with the public credentials an attacker could interleave a correct login between the
+  # guesses). Range 10-86400.
+  auth_fail_window_seconds: 600
+  # How long a banned IP address is refused, in seconds. A banned address is closed at the accept, before
+  # any MQTT byte is read, and its CONNECTs are refused with "banned" (0x8A) before the password is
+  # checked. The sessions that were already connected are left alone. The bans live in memory: a restart
+  # forgets them. Range 60-604800.
+  auth_ban_seconds: 3600
+  # IP ranges (CIDR, IPv4 or IPv6) whose failed logins are never counted and which are never banned. Use it
+  # for the networks the real nodes share (a CGNAT, a VPN, a tunnel): one misconfigured node behind a
+  # shared address would get the whole address banned. An IPv4-mapped IPv6 address (::ffff:a.b.c.d)
+  # matches the IPv4 ranges. Empty by default.
+  auth_ban_exempt: []
 
 users:
   # Firmware default credentials (meshdev / large4cats). Public by design, so uplink only:

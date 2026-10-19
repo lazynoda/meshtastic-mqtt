@@ -25,11 +25,12 @@ namespace Meshtastic.Mqtt;
 /// <para>
 /// The adapter is also where the per-IP limits live (see <see cref="ConnectionGuard"/>): they are applied when
 /// the connection is accepted, before a single MQTT byte is read, so a flood of sockets or of CONNECTs is cut
-/// before it reaches the broker.
+/// before it reaches the broker. The bans of an address (see <see cref="AuthBanManager"/>) are applied in the
+/// same place, before the connection takes a slot or a token of those limits.
 /// </para>
 /// </remarks>
 public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPacketSize, ILogger log,
-    ConnectionGuard? guard = null, DropCounters? drops = null) : IMqttServerAdapter
+    ConnectionGuard? guard = null, DropCounters? drops = null, AuthBanManager? bans = null) : IMqttServerAdapter
 {
     Socket? _listener;
     CancellationTokenSource? _cts;
@@ -38,6 +39,9 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
 
     /// <summary>The per-IP limits applied on accept (never null).</summary>
     internal ConnectionGuard Guard { get; } = guard ?? new ConnectionGuard(new LimitsConfig(), TimeProvider.System);
+
+    /// <summary>The bans applied on accept (null = no bans).</summary>
+    internal AuthBanManager? Bans { get; } = bans;
 
     public Func<IMqttChannelAdapter, Task>? ClientHandler { get; set; }
 
@@ -142,29 +146,26 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
 
             // The per-IP limits, before a single MQTT byte is read. A refused connection is closed at once.
             var remoteIp = (client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "unknown";
+
+            // A banned address is closed at once, before it takes a slot or a token of the per-IP limits:
+            // the ban is cheaper than the limits, and a banned address has nothing to say.
+            if (Bans is not null && Bans.IsBanned(remoteIp))
+            {
+                drops?.Increment(AuthBanManager.BannedIpReason);
+                // Debug per connection: a banned address may keep trying, and a Warning per attempt
+                // would flood the log. The refusals are counted in the same summary as the dropped publishes.
+                log.Debug("Connection refused from {RemoteIp}: {Reason}", remoteIp, AuthBanManager.BannedIpReason);
+                CloseRefused(client);
+                continue;
+            }
+
             if (!Guard.TryAcquire(remoteIp, out var refusal))
             {
                 drops?.Increment(refusal!);
                 // Debug per refusal: an address that floods must not be able to flood the log. The refusals
                 // are counted in the same summary as the dropped publishes.
                 log.Debug("Connection refused from {RemoteIp}: {Reason}", remoteIp, refusal);
-                try
-                {
-                    // A clean close, so the client sees the end of the stream instead of a reset.
-                    client.Shutdown(SocketShutdown.Send);
-                }
-                catch (Exception ex)
-                {
-                    log.Debug("Error closing a refused TCP connection: {Error}", ex.GetType().Name);
-                }
-                try
-                {
-                    client.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    log.Error("Error closing a refused TCP connection: {Error}", ex.GetType().Name);
-                }
+                CloseRefused(client);
                 continue;
             }
 
@@ -179,6 +180,28 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
                 client.Dispose();
                 log.Error("Error starting a TCP connection handler: {Error}", ex.GetType().Name);
             }
+        }
+    }
+
+    /// <summary>Closes a connection the broker refuses at the accept, without a byte of MQTT read.</summary>
+    void CloseRefused(Socket client)
+    {
+        try
+        {
+            // A clean close, so the client sees the end of the stream instead of a reset.
+            client.Shutdown(SocketShutdown.Send);
+        }
+        catch (Exception ex)
+        {
+            log.Debug("Error closing a refused TCP connection: {Error}", ex.GetType().Name);
+        }
+        try
+        {
+            client.Dispose();
+        }
+        catch (Exception ex)
+        {
+            log.Error("Error closing a refused TCP connection: {Error}", ex.GetType().Name);
         }
     }
 

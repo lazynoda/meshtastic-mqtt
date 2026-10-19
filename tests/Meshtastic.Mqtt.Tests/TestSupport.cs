@@ -21,6 +21,13 @@ static class TestSupport
     /// </summary>
     public const string PerIpLimitsOff = "limits:\n  max_connections_per_ip: 0\n  connect_rate_per_ip_per_minute: 0";
 
+    /// <summary>
+    /// The per-IP limits and the auth bans, turned off. The password-queue tests flood the broker with
+    /// wrong logins from one address, and the ban of phase 4 would cut that flood short (and refuse the
+    /// legitimate logins that follow it). Those tests are about the queue, not about the bans.
+    /// </summary>
+    public const string PerIpLimitsAndBansOff = "limits:\n  max_connections_per_ip: 0\n  connect_rate_per_ip_per_minute: 0\n  auth_fail_max_per_ip: 0";
+
     public static int FreePort()
     {
         var l = new TcpListener(IPAddress.Loopback, 0);
