@@ -237,16 +237,18 @@ single MQTT byte is read):
   the entry cap alone: every packet keeps a set of the gateways that sent it. The gateways are kept as
   their node numbers (4 bytes each), not as strings, so with the defaults 200000 packets × 32 gateways =
   6.4 million gateway numbers (about 26 MB of raw values). The overhead is on top of that: the set of
-  gateways of one packet and the entry itself are about 0.85 KB, so the worst case with the defaults is
-  **roughly 150-200 MB**, not the few MB the entry cap suggests. Lower `dedupe_max_entries` or
-  `dedupe_max_gateways_per_packet` if the broker runs with a small memory limit.
+  gateways of one packet, the entry and the tables around it were **measured** on .NET 10, arm64:
+  **~0.86 KB per packet, ~169 MB with the defaults**, not the few MB the entry cap suggests. Lower
+  `dedupe_max_entries` or `dedupe_max_gateways_per_packet` if the broker runs with a small memory limit.
 - `dedupe_window_seconds: 0` turns the dedupe **off**: the copies of one packet can no longer be told
   apart, so **every copy counts separately against the per-`from` budget** (a packet heard by 5 gateways
   costs the node 5 packets, not 1).
 - The caps of the bounded tables are configuration, not constants: `max_tracked_entries` (100000) is the cap
   of the per-IP, the per-client and the per-node rate tables, of the table of failed logins and of the
   table of bans, and `rate_idle_expiry_seconds` (600) is how long an entry of a rate table survives without
-  being used.
+  being used. The rate tables keep their entries in the order of their last use, so the entry evicted
+  when one of them is full is the least recently used one (not the first inserted), and the sweep that
+  forgets the idle entries only visits the entries it forgets.
 
 The order of the checks in the publish hook is fixed: **publish ACL → payload cap → per-client rate →
 packet filter (including the gateway binding) → dedupe → per-node rate**. Every refusal is counted under
@@ -312,8 +314,8 @@ system fail2ban, no nftables, no changes to the host.
 - The bans are in memory: **a restart forgets them**. There is no manual unban.
 
 The tables behind it are bounded (`max_tracked_entries`, 100000 addresses each): the failed logins are
-evicted oldest first, the bans evict the one that ends soonest, and the evictions are counted in the
-periodic summary.
+evicted in the order of their windows (the oldest window first), the bans evict the one that ends
+soonest, and the evictions are counted in the periodic summary.
 
 #### Residual risks
 
@@ -332,7 +334,9 @@ periodic summary.
 
 Logs never contain passwords or message payloads. At the default `information` level:
 
-- Connections, granted subscriptions and the startup line: Information.
+- Connections, granted subscriptions and the startup line: Information. The startup line lists every
+  limit of the configuration, and the limits are also a structured property of the line (`LimitValues`),
+  so a log store keeps the limits of that run as data and not only as text.
 - Failed logins: Warning, one line per attempt with username and remote IP. The broker counts the
   failures itself and bans the address (see [Auth bans](#auth-bans)): the Warnings are for the operators.
   Refused authentication methods, client-id conflicts and "server busy" refusals are also Warning with
@@ -344,9 +348,10 @@ Logs never contain passwords or message payloads. At the default `information` l
   filters it carries.
 - Dropped publishes: one Information line every 60 s with the number of refusals and evictions per reason,
   only when something was refused. The line is `Refused or evicted {Total} in the last 60 s: {reason}:
-  {count}, ...`: it counts more than dropped publishes, so it does not call them all publishes. Publishes
-  refused by the publish ACL are counted there too (`not in publish_allow`, `invalid topic name`), and so
-  are the ones refused by the limits and the dedupe
+  {count}, ...`: it counts more than dropped publishes, so it does not call them all publishes. The counts
+  per reason are also a structured property of the line (`Drops`), so a log store can filter by them.
+  Publishes refused by the publish ACL are counted there too (`not in publish_allow`, `invalid topic
+  name`), and so are the ones refused by the limits and the dedupe
   (`payload larger than max_payload_size`, `publish rate exceeded for the client`,
   `duplicate from the same gateway`, `too many gateways for one packet`, `packet rate exceeded for the node`)
   and the connections refused at the accept (`too many connections from one IP`,
@@ -356,7 +361,9 @@ Logs never contain passwords or message payloads. At the default `information` l
   `evicted: dedupe table full`, `evicted: per-node rate table full`, `evicted: per-client rate table full`,
   `evicted: per-IP connection table full`, `evicted: per-IP rate table full`,
   `evicted: auth failure table full` and `evicted: auth ban table full`. A non-zero count means a
-  cap was reached (a flood of forged ids, most likely) and the oldest entries of that table were dropped.
+  cap was reached (a flood of forged ids, most likely) and the oldest entries of that table were dropped:
+  the least recently used ones in the rate tables (they keep their entries in the order of their last
+  use), the oldest ones in the dedupe, the connections and the failed logins.
 
 `debug` also logs every accepted packet (topic, client, `from`, packet id, portnum).
 
