@@ -61,11 +61,28 @@ static class Cli
     static async Task<int> RunBrokerAsync(BrokerConfig config, Logger logger)
     {
         await using var drops = new DropCounters(logger);
-        using var server = BrokerServer.Create(config, logger, drops: drops).Server;
+
+        BrokerServer.Built built;
+        try
+        {
+            built = BrokerServer.Create(config, logger, drops: drops);
+        }
+        catch (FilterException ex)
+        {
+            // The rules file is missing or is not valid: the broker does not start, like the config.
+            Console.Error.WriteLine($"Invalid filters '{config.Filters?.File}':{Environment.NewLine}"
+                + string.Join(Environment.NewLine, ex.Errors.Select(error => "- " + error)));
+            return 1;
+        }
+
+        using var server = built.Server;
+        using var filter = built.Filter;
 
         var stop = new TaskCompletionSource();
         using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; stop.TrySetResult(); });
         using var sigint = PosixSignalRegistration.Create(PosixSignal.SIGINT, ctx => { ctx.Cancel = true; stop.TrySetResult(); });
+        // SIGHUP reloads the rules file: the operator changes it and the new rules are in force at once.
+        using var sighup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx => { ctx.Cancel = true; filter.ReloadNow(); });
 
         try
         {
@@ -80,7 +97,7 @@ static class Cli
         // Every limit of the configuration is on this line, so the operator sees what the broker is
         // running with (the exempt ranges are listed, not counted). The limits are also attached as a
         // structured property, so the log store keeps them as data and not only as text.
-        StartupLine.Write(logger, config);
+        StartupLine.Write(logger, config, filter);
 
         await stop.Task;
         logger.Information("Shutting down");

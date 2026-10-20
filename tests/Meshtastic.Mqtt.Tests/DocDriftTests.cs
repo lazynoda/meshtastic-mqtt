@@ -22,6 +22,9 @@ public sealed class DocDriftTests
     /// <summary>The reference the keys have to be in.</summary>
     static readonly string ReferencePath = Path.Combine(AppContext.BaseDirectory, "docs", "configuration.md");
 
+    /// <summary>The reference the schema of the filters has to be in.</summary>
+    static readonly string FiltersReferencePath = Path.Combine(AppContext.BaseDirectory, "docs", "filters.md");
+
     /// <summary>The naming convention of the loader.</summary>
     static readonly INamingConvention Naming = UnderscoredNamingConvention.Instance;
 
@@ -29,6 +32,7 @@ public sealed class DocDriftTests
     static readonly Type[] ConfigTypes =
     [
         typeof(BrokerConfig), typeof(ListenerConfig), typeof(LimitsConfig), typeof(UserConfig),
+        typeof(FiltersConfig),
     ];
 
     [Fact]
@@ -42,6 +46,45 @@ public sealed class DocDriftTests
 
         Assert.True(missing.Length == 0,
             "docs/configuration.md does not mention: " + string.Join(", ", missing));
+    }
+
+    [Fact]
+    public void EveryKeyOfTheFilterSchema_IsMentionedInTheFiltersReference()
+    {
+        // The schema of the filters file is derived from the code that reads it, not written here: a key,
+        // an operator or a prefix that is added to the loader fails this test until the reference
+        // mentions it.
+        var reference = File.ReadAllText(FiltersReferencePath);
+        var missing = FilterSchemaTerms()
+            .Where(term => !IsMentioned(reference, term))
+            .OrderBy(term => term, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.True(missing.Length == 0,
+            "docs/filters.md does not mention: " + string.Join(", ", missing));
+    }
+
+    /// <summary>Every word of the schema of the filters file.</summary>
+    static IEnumerable<string> FilterSchemaTerms()
+    {
+        foreach (var scope in FilterSchema.ScopeKeys)
+            yield return scope;
+        foreach (var key in FilterSchema.RuleKeys)
+            yield return key;
+        foreach (var key in FilterSchema.ConstraintKeys)
+            yield return key;
+        foreach (var key in FilterSchema.ConditionKeys)
+            yield return key;
+        foreach (var op in FilterSchema.Ops)
+            yield return op;
+        foreach (var prefix in FilterSchema.FieldPrefixes)
+            yield return prefix.TrimEnd('.');
+        foreach (var value in FilterSchema.UnopenedValues)
+            yield return value;
+        foreach (var name in FilterSchema.PayloadPortnumNames)
+            yield return name;
+        foreach (var name in FilterSchema.PayloadMessageNames)
+            yield return name;
     }
 
     [Fact]

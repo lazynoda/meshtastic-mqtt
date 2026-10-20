@@ -37,6 +37,7 @@ written out and commented.
 | `channels` | map of name to base64 PSK | empty | names: not empty, not only whitespace, and no `/`, `+` or `#`; values: a non-empty base64 PSK of at most 32 bytes | The keys of the channels, by their exact name. The lookup is case-sensitive, like the firmware's channel hash. | When a channel of the mesh uses a key other than `default_psk`. See [Channel keys](packet-filtering.md#channel-keys). |
 | `users` | list of objects | at least one user is required | - | The users the broker accepts, and their ACLs. | When a user is added or removed, or when its ACLs change. |
 | `limits` | map of int (and one list) | the defaults of the tables below | see the tables below | The limits of the broker: the packet sizes, the rates, the bans and the caps of the tables. | See [Limits and dedupe](limits-and-dedupe.md). |
+| `filters` | map of two keys | no filters | see below | The packet filters: where the rules file is and how often it is checked. | When the rules of the mesh change. See [Filters](filters.md). |
 
 The global `drop_undecryptable` is **removed**: it moved to `users[].forward_unopened`, with the
 inverted meaning. A config that still has it does not start: the error says so.
@@ -81,6 +82,23 @@ Each entry of the `users` list is one user the broker accepts.
 An invalid filter (`#` that is not the last level, a `+` or a `#` inside a level, an empty filter) stops the
 broker at startup, with the name of the user and the filter in the message. An empty
 `forward_unopened` stops it too: write `true` or `false`, or leave the key out to use the default.
+
+## The filters
+
+The packet filters live in their own file, and the config only says where it is:
+
+| Key | Type | Default | Range | What it does | When to change it |
+|---|---|---|---|---|---|
+| `filters.file` | string | no filters | the path of the rules file | The file with the rules, by user, by gateway and by node. It is read at startup and checked again every `reload_check_seconds` seconds. | When the rules of the mesh change. See [Filters](filters.md). |
+| `filters.reload_check_seconds` | int | 5 | 1-3600 | How often the rules file is checked for a change. | Rarely: 5 seconds is short enough for an operator and long enough for the disk. |
+
+Without the `filters` section the broker has no filters: every packet that passes the other checks is
+forwarded. A section without a `file` is an error: write the path of the file, or leave the whole
+section out.
+
+A file that is missing or is not valid is a start error, like an invalid config: the broker prints
+every problem it found and exits with the code 1. A file that becomes invalid while the broker runs
+does not stop it: the rules that are in force stay in force and one Warning says what is wrong.
 
 ## The limits
 
@@ -144,6 +162,7 @@ the broker will use, one `key=value` per entry. `0` means "off" for the keys who
 
 - [Security](security.md): the authentication, the ACLs, the client-id ownership and the packet-size cap.
 - [Packet filtering](packet-filtering.md): what the broker accepts on the wire and what it drops.
+- [Filters](filters.md): the rules of the file that drops the packets of a user, a gateway or a node.
 - [Limits and dedupe](limits-and-dedupe.md): what every limit does, the tables and their memory.
 - [Auth bans](auth-bans.md): the bans for the addresses that fail to log in.
 - [Operations](operations.md): where the file lives, how to hash a password, how to run the tests.

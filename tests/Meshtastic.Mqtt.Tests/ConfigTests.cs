@@ -174,12 +174,31 @@ public class ConfigTests
     [InlineData("drop_undecryptable: false")]
     [InlineData("drop_undecryptable:")]
     [InlineData("drop_undecryptable: ~")]
+    [InlineData("drop_undecryptable: maybe")]
     public void T5_TheRemovedDropUndecryptable_IsRejected_NamingTheNewKey(string extra)
     {
         // The global key is gone: it moved to users[].forward_unopened, with the inverted meaning.
+        // Whatever the value is, true, false, empty or a word, the key is refused.
         var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));
         Assert.Contains("forward_unopened", ex.Message);
         Assert.Contains("removed", ex.Message);
+    }
+
+    [Fact]
+    public void P3_TheRemovedKeyInsideAUser_IsRejectedWithTheSameMessage()
+    {
+        // The key is refused wherever it is written, not only at the root of the file.
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(
+            $"users:\n  - username: a\n    password_hash: \"{Hash}\"\n    drop_undecryptable: true\n"));
+        Assert.Equal(ConfigLoader.RemovedDropUndecryptableError, ex.Message);
+    }
+
+    [Fact]
+    public void P3_TheRemovedKeyUnderTheListener_IsRejectedWithTheSameMessage()
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(
+            $"listener:\n  drop_undecryptable: true\nusers:\n  - username: a\n    password_hash: \"{Hash}\"\n"));
+        Assert.Equal(ConfigLoader.RemovedDropUndecryptableError, ex.Message);
     }
 
     [Fact]
@@ -493,4 +512,35 @@ public class ConfigTests
     [Fact]
     public void MissingFile_IsAConfigError() =>
         Assert.Throws<ConfigException>(() => ConfigLoader.LoadFile("/nonexistent/config.yaml"));
+
+    [Fact]
+    public void TheFiltersSection_IsOptional_AndItsKeysAreChecked()
+    {
+        // Without the section there are no filters.
+        Assert.Null(ConfigLoader.Parse(Minimal()).Filters);
+
+        var c = ConfigLoader.Parse(Minimal("filters:\n  file: /etc/meshtastic-mqtt/filters.yaml"));
+        Assert.Equal("/etc/meshtastic-mqtt/filters.yaml", c.Filters!.File);
+        Assert.Equal(5, c.Filters.EffectiveReloadCheckSeconds);
+
+        var other = ConfigLoader.Parse(Minimal("filters:\n  file: /etc/meshtastic-mqtt/filters.yaml\n  reload_check_seconds: 30"));
+        Assert.Equal(30, other.Filters!.ReloadCheckSeconds);
+    }
+
+    [Theory]
+    [InlineData("filters:\n  file: /etc/meshtastic-mqtt/filters.yaml\n  reload_check_seconds: 0")]
+    [InlineData("filters:\n  file: /etc/meshtastic-mqtt/filters.yaml\n  reload_check_seconds: 3601")]
+    [InlineData("filters:\n  file: /etc/meshtastic-mqtt/filters.yaml\n  reload_check_seconds:")]
+    public void AnInvalidReloadPeriod_IsRejected(string extra)
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));
+        Assert.Contains("filters.reload_check_seconds", ex.Message);
+    }
+
+    [Fact]
+    public void AFiltersSectionWithoutAFile_IsRejected()
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal("filters:\n  reload_check_seconds: 5")));
+        Assert.Contains("filters.file", ex.Message);
+    }
 }

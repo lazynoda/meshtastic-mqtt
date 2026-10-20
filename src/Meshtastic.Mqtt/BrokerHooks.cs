@@ -65,6 +65,10 @@ public sealed class BrokerHooks
     readonly PacketGate _gate;
     readonly bool _publishRateOn;
 
+    // The packet filters (per user, per gateway and per node). The ruleset is swapped in one
+    // reference when the rules file changes; the readers never lock.
+    readonly PacketFilter? _filter;
+
     // Client id -> user owning it, mirroring MQTTnet's session store. A claim is taken (pending) when a CONNECT
     // passes authentication, marked connected when MQTTnet reports the client connected, and removed when its
     // session is deleted.
@@ -96,7 +100,7 @@ public sealed class BrokerHooks
     }
 
     public BrokerHooks(BrokerConfig config, ILogger log, int? maxConcurrentKdf = null, DropCounters? drops = null,
-        TimeProvider? time = null, AuthBanManager? bans = null)
+        TimeProvider? time = null, AuthBanManager? bans = null, PacketFilter? filter = null)
     {
         _log = log;
         var users = config.Users ?? [];
@@ -126,6 +130,7 @@ public sealed class BrokerHooks
         _gate = new PacketGate(limits, clock,
             onDedupeEvicted: () => Drops.Increment(PacketGate.DedupeEvictionReason),
             onRateEvicted: () => Drops.Increment(PacketGate.RateEvictionReason));
+        _filter = filter;
 
         foreach (var user in users)
         {
@@ -609,6 +614,21 @@ public sealed class BrokerHooks
                 return Task.CompletedTask;
             }
 
+            // The packet filters: the rules of the user, of the gateway and of the node. The filter runs
+            // after the verdict of the decryption and before the packet gate, so a filtered copy spends
+            // no dedupe entry and no budget of the node, and an allowed copy from another gateway still
+            // passes.
+            if (_filter is not null)
+            {
+                var filterVerdict = _filter.Evaluate(new FilterInput(owner, result.Gateway, result.GatewayNode,
+                    result.From, result.Channel, topic, result.Packet, result.Data, result.Portnum));
+                if (!filterVerdict.Passed)
+                {
+                    DropFiltered(args, filterVerdict, topic, owner, result);
+                    return Task.CompletedTask;
+                }
+            }
+
             // The cross-gateway dedupe and the per-node packet rate. A map report carries no id, so it is not
             // deduplicated, but it is charged as one packet of its node. The gateways are kept as their
             // node numbers: the packet filter already checked the format of the gateway id.
@@ -629,9 +649,11 @@ public sealed class BrokerHooks
             if (result.Unopened)
             {
                 // The packet is forwarded unchanged: it is not a refusal, so it is not counted in the 60 s
-                // summary. One Debug line per packet: the channel, the from, the id and why it was not opened.
-                _log.Debug("Forwarded an unopened packet on {Topic} from {ClientId}: {Why:l} (channel {Channel}, from {From}, id {PacketId})",
-                    Trim(topic), Trim(args.ClientId), result.UnopenedWhy, result.Channel, NodeId(result.From), result.PacketId);
+                // summary. One Debug line per packet: the channel, the from, the id, why it was not opened
+                // and whether the hash of the channel matches the key the broker has.
+                _log.Debug("Forwarded an unopened packet on {Topic} from {ClientId}: {Why:l} (channel {Channel}, from {From}, id {PacketId}, channel hash matches: {HashMatches})",
+                    Trim(topic), Trim(args.ClientId), result.UnopenedWhy, result.Channel, NodeId(result.From),
+                    result.PacketId, result.ChannelHashMatches);
             }
             else
             {
@@ -672,6 +694,23 @@ public sealed class BrokerHooks
                 Trim(topic), Trim(args.ClientId), reason, NodeId(result.From), result.PacketId);
     }
 
+    /// <summary>
+    /// Drops one publish a filter refused. It is a drop like every other: the client stays connected and
+    /// the acknowledgement carries no reason code. The count in the summary keeps the name of the rule
+    /// whole, and the Debug line names the scope, the rule, the channel, the from, the id and the
+    /// gateway. It never carries the payload, the text or the value that matched.
+    /// </summary>
+    void DropFiltered(InterceptingPublishEventArgs args, FilterVerdict verdict, string? topic, string? owner,
+        Inspection result)
+    {
+        args.ProcessPublish = false;
+        var reason = FilterReason(verdict.RuleName ?? "rule");
+        Drops.IncrementRaw(reason);
+        _log.Debug("Dropped publish on {Topic} from {ClientId}: {Reason:l} (scope {Scope:l}, key {ScopeKey:l}, channel {Channel:l}, from {From}, id {PacketId}, gateway {Gateway:l})",
+            Trim(topic), Trim(args.ClientId), reason, Trim(verdict.Scope), Trim(verdict.ScopeKey),
+            result.Channel, NodeId(result.From), result.PacketId, result.Gateway);
+    }
+
     static string NodeId(uint node) => $"!{node:x8}";
 
     /// <summary>
@@ -693,6 +732,12 @@ public sealed class BrokerHooks
     internal const string DuplicateGatewayReason = "duplicate from the same gateway";
     internal const string TooManyGatewaysReason = "too many gateways for one packet";
     internal const string PacketRateReason = "packet rate exceeded for the node";
+
+    /// <summary>
+    /// The drop reason of a packet a filter refused: the name of the rule that refused it. The name is
+    /// kept whole in the summary (a name may hold digits), so the reason is counted as it is.
+    /// </summary>
+    internal static string FilterReason(string ruleName) => $"filtered: {ruleName}";
 
     /// <summary>The drop reason of a verdict of the packet gate.</summary>
     static string GateReason(PacketGate.Verdict verdict) => verdict switch

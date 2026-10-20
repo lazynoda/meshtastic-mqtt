@@ -38,6 +38,13 @@ public sealed class DropCounters : IAsyncDisposable
     }
 
     /// <summary>
+    /// Counts a drop under a key that is kept whole: the reason of a filtered packet carries the name of
+    /// the rule that refused it, and a name may hold digits (<c>block-node-1</c>), which have to reach
+    /// the summary unaltered.
+    /// </summary>
+    public void IncrementRaw(string key) => _counts.AddOrUpdate(key, 1, (_, n) => n + 1);
+
+    /// <summary>
     /// The key of a reason: the numbers are collapsed to <c>N</c>, except a number that is between two
     /// slashes, which is kept (the whole run of digits, not one digit at a time).
     /// </summary>
@@ -57,8 +64,9 @@ public sealed class DropCounters : IAsyncDisposable
         return copy;
     }
 
-    // The whole run of digits, so a number of several digits is collapsed (or kept) as one piece.
-    static readonly System.Text.RegularExpressions.Regex Digits = new("(?<![0-9])[0-9]+(?![0-9])", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    // The whole run of digits, so a number of several digits is collapsed (or kept) as one piece. The
+    // run is matched greedily, so the lookarounds around it would say the same thing.
+    static readonly System.Text.RegularExpressions.Regex Digits = new("[0-9]+", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     /// <summary>Logs and resets the counters; logs nothing when nothing was dropped.</summary>
     public void Flush()

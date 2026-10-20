@@ -356,4 +356,23 @@ public sealed class ForwardUnopenedTests : IAsyncLifetime
         Assert.DoesNotContain(_logs.Events, e => e.Level >= LogEventLevel.Warning);
         Assert.Equal(string.Empty, Summary());
     }
+
+    // ---- P1: the line of a forwarded packet says whether the hash of the channel matches --------------
+
+    [Fact]
+    public async Task T6_TheForwardedLine_SaysWhetherTheChannelHashMatches()
+    {
+        // The hash of the channel is computed for every packet; the line of a forwarded packet says if
+        // it matches the key the broker has, instead of throwing the information away.
+        var config = Config(FreePort());
+        var hooks = new BrokerHooks(config, new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(_logs).CreateLogger());
+        var args = PublishArgs("msh/ES/2/e/Test/!1a2b3c4d", WrongKeyPacket(), "forwarder", "forwarder");
+        await hooks.InterceptPublishAsync(args);
+        Assert.True(args.ProcessPublish);
+
+        var line = Assert.Single(_logs.Events, e => e.RenderMessage().Contains("Forwarded an unopened packet"));
+        Assert.Equal(LogEventLevel.Debug, line.Level);
+        // The packet was encrypted with another key: the hash of the channel does not match.
+        Assert.Contains("channel hash matches: False", line.RenderMessage());
+    }
 }

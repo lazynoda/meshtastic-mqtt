@@ -21,7 +21,9 @@
   <ItemGroup>
     <None Include="Fixtures/*.bin" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../config.example.yaml" Link="config.example.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../filters.example.yaml" Link="filters.example.yaml" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../docs/configuration.md" Link="docs/configuration.md" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../docs/filters.md" Link="docs/filters.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

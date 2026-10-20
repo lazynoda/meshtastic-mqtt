@@ -113,6 +113,14 @@ limits:
   # starts again from scratch). Range 60-86400.
   rate_idle_expiry_seconds: 600
 
+# Packet filters (optional): the rules that drop the packets of a user, a gateway or a node. The rules
+# live in their own file (see filters.example.yaml), which is read at startup and checked again every
+# reload_check_seconds seconds: a change is applied without a restart, and a file that is not valid
+# keeps the rules that are already in force. Without this section the broker has no filters.
+# filters:
+#   file: /etc/meshtastic-mqtt/filters.yaml
+#   reload_check_seconds: 5
+
 users:
   # Firmware default credentials (meshdev / large4cats). Public by design, so uplink only:
   # no subscribe_allow means this user cannot subscribe to anything.

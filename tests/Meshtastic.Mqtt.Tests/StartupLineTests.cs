@@ -31,4 +31,53 @@ public sealed class StartupLineTests
         // The address is rendered as a literal, so the formatter does not quote it.
         Assert.Contains("{Address:l}", startup.MessageTemplate.Text);
     }
+
+    [Fact]
+    public void TheStartupLine_SaysWhetherTheFiltersAreOnAndHowManyRulesTheyHold()
+    {
+        var config = TestSupport.Config(1883);
+        var logs = new LogSink();
+        var logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(logs).CreateLogger();
+
+        // The broker of Program, built the same way: without a filters section there are no filters,
+        // even though the broker holds a filter object (the one that watches a file that is not there).
+        var built = BrokerServer.Create(config, logger);
+        try
+        {
+            StartupLine.Write(logger, config, built.Filter);
+            Assert.Contains("filters=off", Assert.Single(logs.Events).RenderMessage());
+        }
+        finally
+        {
+            built.Filter.Dispose();
+        }
+
+        // With a rules file: the line says how many rules are in force.
+        logs.Events.Clear();
+        var file = FilterFixtures.WriteFile("""
+            users:
+              meshdev:
+                - name: only-iberia
+                  channels:
+                    allow: [Iberia]
+            """);
+        try
+        {
+            var withFilters = FilterFixtures.Config(file);
+            var withBuilt = BrokerServer.Create(withFilters, logger);
+            try
+            {
+                StartupLine.Write(logger, withFilters, withBuilt.Filter);
+                Assert.Contains("filters=on (1 rules)", Assert.Single(logs.Events).RenderMessage());
+            }
+            finally
+            {
+                withBuilt.Filter.Dispose();
+            }
+        }
+        finally
+        {
+            FilterFixtures.Delete(file);
+        }
+    }
 }

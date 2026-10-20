@@ -32,6 +32,12 @@ public sealed class BrokerConfig
 
     public LimitsConfig? Limits { get; set; } = new();
 
+    /// <summary>
+    /// The packet filters: where the rules file is and how often it is checked. The section is
+    /// optional: without it the broker has no filters.
+    /// </summary>
+    public FiltersConfig? Filters { get; set; }
+
     [YamlIgnore] public LogEventLevel MinimumLevel { get; private set; } = LogEventLevel.Information;
     [YamlIgnore] public IPAddress BindAddress { get; private set; } = IPAddress.Any;
     [YamlIgnore] public byte[] DefaultKey { get; private set; } = [];
@@ -54,6 +60,9 @@ public sealed class BrokerConfig
             errors.Add("limits: empty section; leave it out to use the defaults or set its keys");
         else
             Limits.Validate(errors);
+
+        if (Filters is not null)
+            Filters.Validate(errors);
 
         if (Listener.Port is < 1 or > 65535)
             errors.Add($"listener.port: {Listener.Port} is not a valid TCP port (1-65535)");
@@ -560,7 +569,7 @@ public static class ConfigLoader
 
     /// <summary>
     /// Refuses the removed global key with its own message. The document is looked at as a tree, so the key
-    /// is found whatever its value is (true, false, an empty value or a word).
+    /// is found wherever it is written: at the root, under a user or under the listener.
     /// </summary>
     static void RejectRemovedKey(string yaml)
     {
@@ -577,13 +586,29 @@ public static class ConfigLoader
 
         foreach (var document in stream.Documents)
         {
-            if (document.RootNode is not YamlMappingNode map)
-                continue;
-            foreach (var key in map.Children.Keys)
-            {
-                if (key is YamlScalarNode scalar && scalar.Value == RemovedDropUndecryptableKey)
-                    throw new ConfigException(RemovedDropUndecryptableError);
-            }
+            RejectRemovedKey(document.RootNode);
+        }
+    }
+
+    /// <summary>Refuses the removed key wherever it is written, in the document or in one of its nodes.</summary>
+    static void RejectRemovedKey(YamlNode? node)
+    {
+        switch (node)
+        {
+            case YamlMappingNode map:
+                foreach (var (key, value) in map.Children)
+                {
+                    if (key is YamlScalarNode scalar && scalar.Value == RemovedDropUndecryptableKey)
+                        throw new ConfigException(RemovedDropUndecryptableError);
+                    RejectRemovedKey(value);
+                }
+                break;
+            case YamlSequenceNode sequence:
+                foreach (var child in sequence.Children)
+                {
+                    RejectRemovedKey(child);
+                }
+                break;
         }
     }
 }

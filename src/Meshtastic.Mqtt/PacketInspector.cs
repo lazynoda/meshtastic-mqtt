@@ -20,7 +20,17 @@ public sealed record Inspection(
     /// </summary>
     bool Unopened = false,
     /// <summary>Why the packet was not opened: no key for its channel, or a key that does not open it.</summary>
-    string? UnopenedWhy = null);
+    string? UnopenedWhy = null,
+    /// <summary>
+    /// The cleartext header of the packet (the fields the filters read). It is there even for a packet
+    /// the broker could not open: only the payload of the packet is encrypted.
+    /// </summary>
+    MeshPacket? Packet = null,
+    /// <summary>
+    /// The decoded data of the packet, or null when the broker could not open it (a channel packet it
+    /// does not have the key of, a PKI direct message).
+    /// </summary>
+    Protobufs.Data? Data = null);
 
 /// <summary>
 /// Decides whether a published message may reach subscribers. Pure logic on (topic, payload):
@@ -124,9 +134,10 @@ public sealed class PacketInspector(BrokerConfig config)
             // published it decides (users[].forward_unopened), and the reason is the same either way.
             var why = listed ? UnopenedByKeyReason : UnopenedNoKeyReason;
             return new Inspection(false, UndecryptableReason, channel, packet.From, packet.Id, null, hashMatches,
-                topicGateway, gatewayNode, Unopened: true, UnopenedWhy: why);
+                topicGateway, gatewayNode, Unopened: true, UnopenedWhy: why, Packet: packet);
         }
-        return new Inspection(true, "decrypted", channel, packet.From, packet.Id, data.Portnum, hashMatches, topicGateway, gatewayNode);
+        return new Inspection(true, "decrypted", channel, packet.From, packet.Id, data.Portnum, hashMatches,
+            topicGateway, gatewayNode, Packet: packet, Data: data);
     }
 
     Inspection InspectPki(MeshPacket packet, string gateway)
@@ -136,7 +147,8 @@ public sealed class PacketInspector(BrokerConfig config)
             return Drop("malformed PKI packet", PkiChannel, packet);
         return config.DropPki
             ? Drop("PKI DM (drop_pki: true)", PkiChannel, packet)
-            : new Inspection(true, "PKI DM passed through opaquely (drop_pki: false)", PkiChannel, packet.From, packet.Id, null, null, gateway, GatewayNode(gateway));
+            : new Inspection(true, "PKI DM passed through opaquely (drop_pki: false)", PkiChannel, packet.From, packet.Id,
+                null, null, gateway, GatewayNode(gateway), Packet: packet);
     }
 
     /// <summary>
@@ -183,7 +195,7 @@ public sealed class PacketInspector(BrokerConfig config)
             return Drop("map report: gateway_id is not the sender (from)", packet: packet);
 
         return new Inspection(true, "map report", null, packet.From, packet.Id, PortNum.MapReportApp, null,
-            envelope.GatewayId, packet.From);
+            envelope.GatewayId, packet.From, Packet: packet, Data: data);
     }
 
     /// <summary>
@@ -315,5 +327,5 @@ public sealed class PacketInspector(BrokerConfig config)
     static uint GatewayNode(string? gateway) => TryParseGatewayId(gateway, out var node) ? node : 0;
 
     static Inspection Drop(string reason, string? channel = null, MeshPacket? packet = null, bool? hashMatches = null) =>
-        new(false, reason, channel, packet?.From ?? 0, packet?.Id ?? 0, null, hashMatches);
+        new(false, reason, channel, packet?.From ?? 0, packet?.Id ?? 0, null, hashMatches, Packet: packet);
 }

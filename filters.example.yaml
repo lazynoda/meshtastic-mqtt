@@ -1,0 +1,72 @@
+# Packet filters of the broker.
+#
+# Copy to filters.yaml (git-ignored) and point the config at it:
+#
+#   filters:
+#     file: /etc/meshtastic-mqtt/filters.yaml
+#     reload_check_seconds: 5
+#
+# The file is read at startup and checked again every reload_check_seconds seconds: a change is
+# applied without a restart, and a file that is not valid keeps the rules that are already in force.
+# The whole file is English, the node ids are the documentation ones (!a1b2c3d4, !deadbeef).
+
+# Three scopes, all optional: users (the user that owns the session), gateways (the gateway of the
+# topic) and nodes (the `from` of the packet). The key "*" applies to every user, gateway or node.
+#
+# A packet must pass EVERY rule of EVERY scope that applies to it: the rules do not have an order and
+# there is no "first match". One rule that fails drops the packet.
+users:
+  # The rules of one user of the config.yaml (an unknown user is an error).
+  meshdev:
+    # A rule has a name (unique in the file) and one or more constraints.
+    - name: only-the-public-channels
+      # The channel of the packet (the channel_id of the envelope, case-sensitive).
+      # "PKI" is the channel of the direct messages.
+      channels:
+        allow:
+          - Iberia
+          - SFNarrow
+      # The MQTT topic of the publish, with the same wildcards as the ACLs.
+      topics:
+        deny:
+          - "msh/EU_868/2/e/Private/#"
+  "*":
+    # A rule that applies to every user of the broker.
+    - name: no-text-on-the-public-user
+      portnums:
+        deny:
+          - TEXT_MESSAGE_APP
+      # A rule that reads the content of a packet needs a packet the broker could open: an unopened
+      # packet (a channel whose key the broker does not have) is dropped by this rule.
+      unopened: drop
+
+gateways:
+  # The rules of one gateway of the mesh.
+  "!a1b2c3d4":
+    - name: only-iberia-and-sfnarrow
+      channels:
+        allow:
+          - Iberia
+          - SFNarrow
+
+nodes:
+  # The rules of one node, whatever gateway uploads it.
+  "!deadbeef":
+    - name: only-position-and-text
+      portnums:
+        allow:
+          - POSITION_APP
+          - TEXT_MESSAGE_APP
+      unopened: drop
+  "*":
+    # A rule that applies to every node: here, an anti-spam rule on the text of the messages.
+    # The text of a message is the payload of a TEXT_MESSAGE_APP, and it is the only thing a rule may
+    # read that is not a protobuf.
+    - name: no-spam
+      drop_if:
+        - field: payload.text
+          op: regex
+          value: "buy[ ]+now"
+          portnum: TEXT_MESSAGE_APP
+      # An unopened packet has no text: it is not dropped by this rule.
+      unopened: allow

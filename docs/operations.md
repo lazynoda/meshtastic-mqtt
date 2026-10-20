@@ -9,9 +9,12 @@ Building, running, upgrading and hardening the broker.
 ```bash
 docker build -t meshtastic-mqtt .
 cp config.example.yaml config.yaml   # edit it; config.yaml is git-ignored
+mkdir -p filters                    # the rules file lives here (see "Blocking a node")
+cp filters.example.yaml filters/filters.yaml
 docker run -d --name meshtastic-mqtt \
   -p 1883:1883 \
   -v "$PWD/config.yaml:/config/config.yaml:ro" \
+  -v "$PWD/filters:/etc/meshtastic-mqtt:ro" \
   --read-only \
   --memory 512m \
   --log-opt max-size=10m --log-opt max-file=3 \
@@ -26,6 +29,9 @@ docker logs -f meshtastic-mqtt
 - Logs go to stdout as compact JSON (Serilog CLEF), one event per line.
 - Multi-arch: the official .NET base images are multi-platform, so a plain `docker build` works on
   amd64 and arm64 hosts; `docker buildx build --platform linux/amd64,linux/arm64 .` builds both.
+- The rules file of the [packet filters](filters.md) is mounted **through its directory**, and the
+  broker only reads it, so the read-only mount is fine. The rules are changed on the host (see
+  [Blocking a node](#blocking-a-node-while-the-broker-runs)).
 
 The image needs one thing: a config file. There is no other secret in it, and nothing is baked into the
 image.
@@ -77,6 +83,76 @@ The salt and the hash are base64. The firmware-default `meshdev` / `large4cats` 
 by design; the hash in `config.example.yaml` is the one of that password, and it needs no hashing.
 
 See [Password hashes](security.md#password-hashes) for the parameters.
+
+## Blocking a node while the broker runs
+
+The rules file of the [packet filters](filters.md) is the way to stop the packets of a node, of a
+gateway or of a user without touching the config and without a restart. The file is checked every
+`reload_check_seconds` seconds, and a `SIGHUP` reloads it at once.
+
+**The file has to be mounted through its directory, not as a single file.** A bind mount of one file
+keeps the inode it had when the mount was made, so a file that is replaced atomically on the host is
+not seen by the container: the broker would keep reading the old file. Mount the directory instead
+(the broker only reads the file, so a read-only mount is fine) and point the config at it:
+
+```yaml
+filters:
+  file: /etc/meshtastic-mqtt/filters.yaml
+  reload_check_seconds: 5
+```
+
+```bash
+docker run -d --name meshtastic-mqtt \
+  -p 1883:1883 \
+  -v "$PWD/config.yaml:/config/config.yaml:ro" \
+  -v "$PWD/filters:/etc/meshtastic-mqtt:ro" \
+  --read-only \
+  meshtastic-mqtt
+```
+
+The rule that blocks a node goes in the `nodes:` section of the file:
+
+```yaml
+nodes:
+  "!deadbeef":
+    - name: block-deadbeef
+      topics:
+        deny: ["#"]
+```
+
+It drops **every** packet of the node `!deadbeef`, whatever the channel and whatever the gateway
+uploads it: `#` matches every topic. The rule does not need an opened packet, so it also drops the
+packets of the channels whose key the broker does not have (the ones it would otherwise forward
+unchanged).
+
+The file is edited **on the host**, and it is replaced **atomically**: the broker reads the whole file
+when it changes, so a file that is written in place could be read half-written. Edit a copy next to it
+and move the copy over the old one (a rename is atomic):
+
+```bash
+# the rules of the file, as the broker sees them
+docker exec meshtastic-mqtt cat /etc/meshtastic-mqtt/filters.yaml
+
+# a copy of the file, with the new rule added to its nodes: section
+cp "$PWD/filters/filters.yaml" "$PWD/filters/filters.yaml.new"
+vi "$PWD/filters/filters.yaml.new"
+
+# the new file in place, in one step
+mv "$PWD/filters/filters.yaml.new" "$PWD/filters/filters.yaml"
+
+# reload the rules now, without waiting for the next check
+docker kill --signal=HUP meshtastic-mqtt
+```
+
+Without the `SIGHUP`, the new rules are in force at the next check, `reload_check_seconds` seconds
+later (5 by default). The packets the node sends after the reload are dropped, with the reason
+`filtered: block-deadbeef` in the 60 s summary.
+
+A file that is not valid does not replace the rules that are in force: the broker keeps them and
+writes one Warning with every problem and its line. Fix the file and reload again.
+
+To block an **address** instead of a node, use the [auth bans](auth-bans.md). To refuse a **user** at
+the door, use its `publish_allow`.
 
 ## Running the tests
 
@@ -158,5 +234,6 @@ The broker is built to be exposed to the internet, but a few things are still th
 ## See also
 
 - [Configuration](configuration.md): the keys of the config file.
+- [Filters](filters.md): the rules that drop the packets of a user, a gateway or a node.
 - [Logging](logging.md): what the broker writes and how to read it.
 - [Node setup](node-setup.md): what the nodes of the mesh have to be told.
