@@ -6,8 +6,9 @@ listener:
   port: 1883              # plain MQTT, no TLS in this version
 
 # verbose | debug | information | warning | error | fatal
-# "information": connections, auth failures and refusals (warning), and every 60 s a count of dropped publishes
-# per reason. "debug" also logs every accepted and dropped packet (topic, client, from, id, portnum; never the payload).
+# "information": connections, auth failures and refusals (warning), and every 60 s a count of what was
+# refused or evicted, per reason (dropped publishes, refused connections and evictions). "debug" also
+# logs every accepted and dropped packet (topic, client, from, id, portnum; never the payload).
 log_level: information
 
 # Drop channel packets that do not decrypt with the key configured for their channel
