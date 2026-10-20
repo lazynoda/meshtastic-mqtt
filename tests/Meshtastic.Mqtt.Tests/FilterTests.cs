@@ -45,6 +45,50 @@ static class FilterFixtures
         }
     }
 
+    /// <summary>
+    /// A file with ten thousand rules that share one name: nine thousand nine hundred and ninety-nine
+    /// problems, so the report of the file has to count them.
+    /// </summary>
+    public static string FileWithDuplicateNames()
+    {
+        var builder = new StringBuilder("gateways:\n");
+        for (var scope = 1; scope <= 10; scope++)
+        {
+            builder.Append($"  \"!{scope:x8}\":\n");
+            for (var i = 0; i < 1000; i++)
+                builder.Append("    - name: the-same\n      channels:\n        allow: [Iberia]\n");
+        }
+        return builder.ToString();
+    }
+
+    /// <summary>A file with a number of distinct patterns of regular expressions.</summary>
+    public static string FileWithPatterns(int count) =>
+        FileWithPatterns(count, index => $"buy[ ]+now-{index}");
+
+    /// <summary>A file with a number of distinct patterns of regular expressions.</summary>
+    /// <param name="count">How many distinct patterns the file holds.</param>
+    /// <param name="pattern">The pattern of each rule, by its number.</param>
+    public static string FileWithPatterns(int count, Func<int, string> pattern)
+    {
+        var builder = new StringBuilder("gateways:\n");
+        var index = 0;
+        for (var scope = 1; scope <= 10 && index < count; scope++)
+        {
+            builder.Append($"  \"!{scope:x8}\":\n");
+            for (var i = 0; i < 1000 && index < count; i++, index++)
+            {
+                builder.Append($"    - name: rule-{index}\n");
+                builder.Append("      drop_if:\n");
+                builder.Append("        - field: payload.text\n");
+                builder.Append("          op: regex\n");
+                builder.Append($"          value: \"{pattern(index)}\"\n");
+                builder.Append("          portnum: TEXT_MESSAGE_APP\n");
+                builder.Append("      unopened: allow\n");
+            }
+        }
+        return builder.ToString();
+    }
+
     /// <summary>The config of the tests: two users, two channels and, maybe, a rules file.</summary>
     public static BrokerConfig Config(string? filtersFile = null, bool dropPki = true, string extra = "") =>
         ConfigLoader.Parse("listener:\n  bind_address: 127.0.0.1\n  port: 1883\n"

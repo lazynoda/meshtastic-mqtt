@@ -265,6 +265,11 @@ public sealed class PacketFilter : IDisposable
     /// <summary>Reads the file and compiles its rules.</summary>
     FilterRuleset LoadRules(string path)
     {
+        // A file that is over the budget of its size is not read: the size is the problem, and the
+        // rules that are in force stay in force.
+        var info = _file.Stat(path);
+        if (info is not null && info.Value.Size > FilterLoader.MaxFileBytes)
+            throw new FilterException([$"{path}: {FilterLoader.SizeMessage(info.Value.Size)}"]);
         var text = _file.ReadAllText(path);
         if (text is null)
             throw new FilterException([$"{path}: the file cannot be read"]);
@@ -307,6 +312,20 @@ public sealed class PacketFilter : IDisposable
             return new FileState { Readable = false, HashedAt = _clock.GetUtcNow() };
 
         var now = _clock.GetUtcNow();
+
+        // A file that is over the budget of its size is not read and not hashed: the size is the
+        // problem, and the state of the file is its size and its time.
+        if (info.Value.Size > FilterLoader.MaxFileBytes)
+        {
+            return new FileState
+            {
+                Readable = true,
+                Size = info.Value.Size,
+                Mtime = info.Value.Mtime,
+                HashedAt = now,
+            };
+        }
+
         var previous = _warned ?? _loaded;
         if (!forceRead && previous is not null && previous.Readable && previous.Size == info.Value.Size
             && previous.Mtime == info.Value.Mtime && now - previous.HashedAt < HashEvery)

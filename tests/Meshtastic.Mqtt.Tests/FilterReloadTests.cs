@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using Meshtastic.Mqtt;
 using Meshtastic.Protobufs;
@@ -636,6 +637,120 @@ public sealed class FilterReloadTests
             await Task.WhenAll(readers);
 
             Assert.Equal(0, failures);
+        }
+        finally
+        {
+            FilterFixtures.Delete(path);
+        }
+    }
+
+    // ---- X1: a file that is over the budget of its patterns ---------------------------------------------------
+
+    [Fact]
+    public void X1_AFileWithTooManyPatternsOnReload_KeepsTheRulesInForce()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"mmqtt-filters-{Guid.NewGuid():N}.yaml");
+        try
+        {
+            Write(path, OneRule);
+            var config = FilterFixtures.Config(path);
+            var (logger, logs) = FilterFixtures.Logger();
+            using var filter = new PacketFilter(config, logger, startWatcher: false);
+
+            // The shape of the review: the file allocates more memory when its patterns are compiled
+            // than the budget of the file, so it does not load.
+            Write(path, FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns,
+                index => $"(?i)buy (cheap|free) [a-z]+ now {index}"));
+            filter.CheckForChange();
+
+            // The rules that are in force stay in force, and the problem is reported once.
+            Assert.Equal(1, filter.RuleCount);
+            var warning = Assert.Single(logs.Events, e => e.Level == LogEventLevel.Warning);
+            Assert.Contains("regex memory", warning.RenderMessage());
+        }
+        finally
+        {
+            FilterFixtures.Delete(path);
+        }
+    }
+
+    // ---- X2: a file that is over the budget of its size --------------------------------------------------------
+
+    [Fact]
+    public void X2_AnOversizeFileAtStartup_IsASizeErrorAndTheFileIsNotRead()
+    {
+        var file = new FakeFilterFile(OversizeText());
+        var config = FilterFixtures.Config("/fake/filters.yaml");
+        var (logger, _) = FilterFixtures.Logger();
+
+        var ex = Assert.Throws<FilterException>(() =>
+            new PacketFilter(config, logger, startWatcher: false, TimeProvider.System, file));
+        Assert.Contains("bigger than", ex.Message);
+        Assert.Contains(FilterLoader.MaxFileBytes.ToString(CultureInfo.InvariantCulture), ex.Message);
+
+        // The file was not read: its size was enough to refuse it.
+        Assert.Equal(0, file.HashReads);
+        Assert.Equal(0, file.TextReads);
+    }
+
+    [Fact]
+    public void X2_AnOversizeFileOnReload_IsOneWarningAndTheRulesInForceStay()
+    {
+        var file = new FakeFilterFile(OneRule);
+        var config = FilterFixtures.Config("/fake/filters.yaml");
+        var (logger, logs) = FilterFixtures.Logger();
+        using var filter = new PacketFilter(config, logger, startWatcher: false, TimeProvider.System, file);
+        var hashReads = file.HashReads;
+        var textReads = file.TextReads;
+
+        // The file grows over the budget of its size.
+        file.Change(OversizeText());
+        filter.CheckForChange();
+
+        // The rules that are in force stay in force, and the problem is reported once.
+        Assert.Equal(1, filter.RuleCount);
+        var warning = Assert.Single(logs.Events, e => e.Level == LogEventLevel.Warning);
+        Assert.Contains("bigger than", warning.RenderMessage());
+        Assert.Contains(FilterLoader.MaxFileBytes.ToString(CultureInfo.InvariantCulture), warning.RenderMessage());
+
+        // The file was not read: its size was enough to refuse it.
+        Assert.Equal(hashReads, file.HashReads);
+        Assert.Equal(textReads, file.TextReads);
+
+        // The second poll of the same file does not report it again.
+        filter.CheckForChange();
+        Assert.Single(logs.Events, e => e.Level == LogEventLevel.Warning);
+    }
+
+    /// <summary>A file that is over the budget of its size.</summary>
+    static string OversizeText() => new('x', FilterLoader.MaxFileBytes + 1);
+
+    // ---- X4: the report of a file with many problems ----------------------------------------------------------
+
+    [Fact]
+    public void X4_TheWarningOfABrokenFileWithManyProblems_ListsTwentyAndCountsTheRest()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"mmqtt-filters-{Guid.NewGuid():N}.yaml");
+        try
+        {
+            Write(path, OneRule);
+            var config = FilterFixtures.Config(path);
+            var (logger, logs) = FilterFixtures.Logger();
+            using var filter = new PacketFilter(config, logger, startWatcher: false);
+
+            // Ten thousand rules with the same name: nine thousand nine hundred and ninety-nine
+            // problems. The Warning lists the first twenty and counts the rest.
+            Write(path, FilterFixtures.FileWithDuplicateNames());
+            filter.CheckForChange();
+
+            // The rules that are in force stay in force.
+            Assert.Equal(1, filter.RuleCount);
+            var message = Assert.Single(logs.Events, e => e.Level == LogEventLevel.Warning).RenderMessage();
+            Assert.Contains("... and 9979 more errors", message);
+            Assert.Equal(FilterException.MaxReportedErrors + 1, message.Split("; ").Length);
+
+            // The report is small: a broken file does not write a megabyte of log.
+            Assert.True(message.Length < 8 * 1024, $"the report is {message.Length} characters");
         }
         finally
         {

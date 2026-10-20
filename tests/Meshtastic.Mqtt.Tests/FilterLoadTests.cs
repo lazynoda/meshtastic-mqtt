@@ -13,6 +13,12 @@ public sealed class FilterLoadTests
 {
     static readonly string[] Users = ["meshdev", "alice"];
 
+    /// <summary>
+    /// The pattern of the review: the shape that costs the most memory when it is compiled (a
+    /// case-insensitive alternation and a character class).
+    /// </summary>
+    static readonly Func<int, string> ReviewPattern = index => $"(?i)buy (cheap|free) [a-z]+ now {index}";
+
     /// <summary>Compiles a file that has to fail, and returns the problems it found.</summary>
     static IReadOnlyList<string> Load(string yaml)
     {
@@ -909,7 +915,7 @@ public sealed class FilterLoadTests
                   drop_if:
                     - field: data.portnum
                       op: lt
-                      value: 512
+                      value: 511
                   unopened: allow
             """, Users, "filters.yaml");
         Assert.Equal(2, ruleset.RuleCount);
@@ -972,6 +978,218 @@ public sealed class FilterLoadTests
                       value: [18446744073709551615, -9223372036854775808]
             """, Users, "filters.yaml");
         Assert.Equal(1, ruleset.RuleCount);
+    }
+
+    // ---- X1: the budget of the patterns of the regular expressions --------------------------------------------
+
+    [Fact]
+    public void X1_AFileOverTheRegexMemoryBudget_IsALoadErrorAndStopsEarly()
+    {
+        // The shape of the review: the most expensive pattern of the measurements. A thousand of them
+        // allocate more memory than the budget of the file, so the load stops long before the last
+        // one.
+        var yaml = FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns, ReviewPattern);
+        var ex = Assert.Throws<FilterException>(() => FilterLoader.Parse(yaml, Users, "filters.yaml"));
+        Assert.Contains("regex memory", ex.Message);
+        Assert.Contains(FilterLoader.MaxRegexBytes.ToString(CultureInfo.InvariantCulture), ex.Message);
+        // The message names the pattern that crossed the budget.
+        Assert.Contains("(?i)buy (cheap|free) [a-z]+ now ", ex.Message);
+
+        // The load stopped at the budget: it did not compile the thousand patterns of the file.
+        Assert.True(ex.CompiledPatterns < FilterLoader.MaxRegexPatterns,
+            $"the loader compiled {ex.CompiledPatterns} patterns");
+        Assert.True(ex.RegexBytes > FilterLoader.MaxRegexBytes,
+            $"the patterns of the file allocated {ex.RegexBytes} bytes");
+    }
+
+    [Fact]
+    public void X1_CheapLiteralsUnderTheBudget_Load()
+    {
+        // Two hundred cheap literals: the file loads, and the memory it allocates is under the budget.
+        var ruleset = FilterLoader.Parse(FilterFixtures.FileWithPatterns(200, index => $"spam{index}"),
+            Users, "filters.yaml");
+        Assert.Equal(200, ruleset.RegexPatternCount);
+        Assert.True(ruleset.RegexBytes > 0);
+        Assert.True(ruleset.RegexBytes <= FilterLoader.MaxRegexBytes,
+            $"the patterns of the file allocated {ruleset.RegexBytes} bytes");
+    }
+
+    [Fact]
+    public void X1_AFileExactlyAtTheBudgetOfThePatterns_Loads()
+    {
+        // A thousand distinct patterns: the file loads, and every pattern is compiled once. The budget
+        // of the memory is out of the way, so only the count of the patterns is checked.
+        var ruleset = FilterLoader.Parse(FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns),
+            Users, "filters.yaml", long.MaxValue);
+        Assert.Equal(FilterLoader.MaxRegexPatterns, ruleset.RegexPatternCount);
+    }
+
+    [Fact]
+    public void X1_ThousandAndOneDistinctPatterns_IsALoadErrorAndStopsCompiling()
+    {
+        // One pattern over the budget: the file does not load at all, and the load stops before it
+        // compiles the pattern that goes over the budget.
+        var yaml = FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns + 1);
+        var ex = Assert.Throws<FilterException>(() => FilterLoader.Parse(yaml, Users, "filters.yaml", long.MaxValue));
+        Assert.Contains("budget", ex.Message);
+        Assert.Contains("regex patterns", ex.Message);
+        Assert.Contains(FilterLoader.MaxRegexPatterns.ToString(CultureInfo.InvariantCulture), ex.Message);
+        Assert.Contains((FilterLoader.MaxRegexPatterns + 1).ToString(CultureInfo.InvariantCulture), ex.Message);
+
+        // The load stopped at the budget: it did not compile the thousand and first pattern.
+        Assert.True(ex.CompiledPatterns <= FilterLoader.MaxRegexPatterns,
+            $"the loader compiled {ex.CompiledPatterns} patterns");
+    }
+
+    [Fact]
+    public void X1_ASmallBudgetOfTheMemory_StopsAtTheFirstPattern()
+    {
+        // A budget of one byte: the first pattern goes over it, and the load stops there.
+        var yaml = FilterFixtures.FileWithPatterns(3);
+        var ex = Assert.Throws<FilterException>(() => FilterLoader.Parse(yaml, Users, "filters.yaml", 1));
+        Assert.Contains("regex memory", ex.Message);
+        Assert.Contains("buy[ ]+now-0", ex.Message);
+        Assert.Contains("1 bytes", ex.Message);
+
+        // The load stopped at the first pattern: no other pattern was compiled.
+        Assert.Equal(1, ex.CompiledPatterns);
+    }
+
+    [Fact]
+    public void X1_FourThousandConditionsWithTheSamePattern_CompileOneRegex()
+    {
+        // The same pattern four thousand times, through the aliases of the YAML: it is compiled once
+        // and shared by every condition, so the file costs the memory of one pattern.
+        var builder = new StringBuilder();
+        builder.AppendLine("users:");
+        builder.AppendLine("  meshdev:");
+        builder.AppendLine("    - name: rule-0");
+        builder.AppendLine("      drop_if:");
+        builder.AppendLine("        - &cond");
+        builder.AppendLine("          field: payload.text");
+        builder.AppendLine("          op: regex");
+        builder.AppendLine("          value: \"buy[ ]+now\"");
+        builder.AppendLine("          portnum: TEXT_MESSAGE_APP");
+        builder.AppendLine("      unopened: allow");
+        for (var i = 1; i <= 3; i++)
+        {
+            builder.AppendLine($"    - name: rule-{i}");
+            builder.AppendLine($"      drop_if: [{Aliases(1000)}]");
+            builder.AppendLine("      unopened: allow");
+        }
+        builder.AppendLine("    - name: rule-4");
+        builder.AppendLine($"      drop_if: [{Aliases(999)}]");
+        builder.AppendLine("      unopened: allow");
+
+        var ruleset = FilterLoader.Parse(builder.ToString(), Users, "filters.yaml");
+        var conditions = ruleset.Users["meshdev"]
+            .SelectMany(rule => rule.DropIf ?? Enumerable.Empty<FilterCondition>())
+            .ToArray();
+        Assert.Equal(4000, conditions.Length);
+
+        // One pattern, one compiled regular expression, shared by the four thousand conditions.
+        Assert.Equal(1, ruleset.RegexPatternCount);
+        Assert.Single(conditions.Select(condition => condition.Pattern).Distinct());
+
+        // The pattern is compiled once, so the memory of the file is the memory of one pattern.
+        Assert.True(ruleset.RegexBytes < 5 * 1024 * 1024,
+            $"the patterns of the file allocated {ruleset.RegexBytes} bytes");
+    }
+
+    [Fact]
+    public void X1_TwoRulesWithTheSamePattern_ShareTheCompiledRegex()
+    {
+        var ruleset = FilterLoader.Parse("""
+            users:
+              meshdev:
+                - name: the-first
+                  drop_if:
+                    - field: payload.text
+                      op: regex
+                      value: "buy[ ]+now"
+                      portnum: TEXT_MESSAGE_APP
+                  unopened: allow
+                - name: the-second
+                  drop_if:
+                    - field: payload.text
+                      op: regex
+                      value: "buy[ ]+now"
+                      portnum: TEXT_MESSAGE_APP
+                  unopened: allow
+            """, Users, "filters.yaml");
+
+        var first = ruleset.Users["meshdev"][0].DropIf![0].Pattern;
+        var second = ruleset.Users["meshdev"][1].DropIf![0].Pattern;
+        Assert.NotNull(first);
+        Assert.Same(first, second);
+        Assert.Equal(1, ruleset.RegexPatternCount);
+    }
+
+    /// <summary>A list of aliases of the anchor of the file.</summary>
+    static string Aliases(int count) => string.Join(", ", Enumerable.Repeat("*cond", count));
+
+    // ---- X4: the report of a file with many problems ----------------------------------------------------------
+
+    [Fact]
+    public void X4_ABrokenFileWithManyProblems_ReportsTheFirstTwentyAndCountsTheRest()
+    {
+        // Ten thousand rules with the same name: nine thousand nine hundred and ninety-nine problems.
+        // The report lists the first twenty and counts the rest.
+        var ex = Assert.Throws<FilterException>(() =>
+            FilterLoader.Parse(FilterFixtures.FileWithDuplicateNames(), Users, "filters.yaml"));
+        Assert.Equal(FilterException.MaxReportedErrors + 1, ex.Errors.Count);
+        Assert.Equal("... and 9979 more errors", ex.Errors[^1]);
+        Assert.Equal(9999, ex.TotalErrors);
+
+        // The report is small: a broken file does not write a megabyte of log.
+        Assert.True(ex.Message.Length < 8 * 1024, $"the report is {ex.Message.Length} characters");
+    }
+
+    // ---- X5: the range of the values compared with the portnum -----------------------------------------------
+
+    [Fact]
+    public void X5_AComparisonWithAPortnumOutOfRange_IsALoadError()
+    {
+        // The comparisons are checked like the equality: a value outside the range of the firmware is
+        // not a portnum.
+        foreach (var op in new[] { "lt", "le", "gt", "ge" })
+        {
+            var message = Message($$"""
+                users:
+                  meshdev:
+                    - name: bad-threshold
+                      drop_if:
+                        - field: data.portnum
+                          op: {{op}}
+                          value: 9999
+                      unopened: allow
+                """);
+            Assert.Contains("bad-threshold", message);
+            Assert.Contains("9999", message);
+            Assert.Contains("portnum", message);
+        }
+    }
+
+    [Fact]
+    public void X5_AComparisonWithAPortnumInRange_IsAccepted()
+    {
+        var ruleset = FilterLoader.Parse("""
+            users:
+              meshdev:
+                - name: a-threshold
+                  drop_if:
+                    - field: data.portnum
+                      op: lt
+                      value: 511
+                  unopened: allow
+                - name: another-threshold
+                  drop_if:
+                    - field: data.portnum
+                      op: ge
+                      value: 0
+                  unopened: allow
+            """, Users, "filters.yaml");
+        Assert.Equal(2, ruleset.RuleCount);
     }
 
     // ---- the file itself -------------------------------------------------------------------------------------
