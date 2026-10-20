@@ -160,15 +160,17 @@ Start from [`config.example.yaml`](config.example.yaml).
 | `limits.max_payload_size` | `512` | Largest publish payload accepted, in bytes. Checked in the publish hook, after the publish ACL and before the packet is parsed. Range 64-`max_packet_size`. |
 | `limits.publish_rate_per_client_per_minute` | `120` | Publishes one client may send per minute (token bucket, with the burst below). The key is the user that owns the session plus the client id. `0` turns the rate off. Range 0-1000000. |
 | `limits.publish_burst_per_client` | `60` | Burst of the per-client publish rate: how many publishes one client may send at once. `0` turns the rate off. Range 0-1000000. |
-| `limits.dedupe_window_seconds` | `120` | How long a packet is remembered for the cross-gateway dedupe. `0` turns the dedupe off. Range 0-86400. |
+| `limits.dedupe_window_seconds` | `120` | How long a packet is remembered for the cross-gateway dedupe. `0` turns the dedupe off, and then every copy of a packet counts separately against the per-`from` budget. Range 0-86400. |
 | `limits.dedupe_max_gateways_per_packet` | `32` | How many gateways may send the same packet before the further copies are dropped. One copy per gateway is kept. Range 1-100000. |
-| `limits.dedupe_max_entries` | `200000` | How many packets are remembered for the dedupe at once; the oldest are evicted when the cap is hit. Range 1-10000000. |
+| `limits.dedupe_max_entries` | `200000` | How many packets are remembered for the dedupe at once; the oldest are evicted when the cap is hit. The real memory ceiling is this cap **times** `dedupe_max_gateways_per_packet` (see [Limits and dedupe](#limits-and-dedupe)). Range 1-10000000. |
 | `limits.packet_rate_per_from_per_minute` | `30` | Packets one node (the packet's `from`) may send per minute (token bucket, with the burst below). A packet is charged once, on its first copy. `0` turns the rate off. Range 0-1000000. |
 | `limits.packet_burst_per_from` | `15` | Burst of the per-node packet rate: how many packets one node may send at once. `0` turns the rate off. Range 0-1000000. |
 | `limits.auth_fail_max_per_ip` | `10` | Failed logins one IP address may make before it is banned. Only a wrong password (or an unknown user, or an unsupported authentication method) counts. `0` turns the bans off. Range 0-100000. |
 | `limits.auth_fail_window_seconds` | `600` | How long the failed logins of one IP address are counted. The window starts with the first failure; when it has passed, the next failure starts a new one. Range 10-86400. |
 | `limits.auth_ban_seconds` | `3600` | How long a banned IP address is refused. The bans live in memory: a restart forgets them. Range 60-604800. |
 | `limits.auth_ban_exempt` | empty | IP ranges (CIDR, IPv4 or IPv6) whose failed logins are never counted and which are never banned. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) matches the IPv4 ranges. |
+| `limits.max_tracked_entries` | `100000` | How many entries the bounded tables may hold at once: the per-IP, the per-client and the per-node rate tables, the table of failed logins and the table of bans. The dedupe table has its own cap (`dedupe_max_entries`). Range 1000-10000000. |
+| `limits.rate_idle_expiry_seconds` | `600` | How long an entry of a rate table survives without being used, in seconds: the per-IP, the per-client and the per-node rate tables. Range 60-86400. |
 
 ### Limits
 
@@ -231,6 +233,20 @@ single MQTT byte is read):
   first seen, and the table never holds more than `dedupe_max_entries` (200000) packets: the oldest are
   evicted. Map reports carry no packet id and are not deduplicated; each one is charged as one packet of its
   node.
+- The **real memory ceiling of the dedupe is `dedupe_max_entries` × `dedupe_max_gateways_per_packet`**, not
+  the entry cap alone: every packet keeps a set of the gateways that sent it. The gateways are kept as
+  their node numbers (4 bytes each), not as strings, so with the defaults 200000 packets × 32 gateways =
+  6.4 million gateway numbers (about 26 MB of raw values). The overhead is on top of that: the set of
+  gateways of one packet and the entry itself are about 0.85 KB, so the worst case with the defaults is
+  **roughly 150-200 MB**, not the few MB the entry cap suggests. Lower `dedupe_max_entries` or
+  `dedupe_max_gateways_per_packet` if the broker runs with a small memory limit.
+- `dedupe_window_seconds: 0` turns the dedupe **off**: the copies of one packet can no longer be told
+  apart, so **every copy counts separately against the per-`from` budget** (a packet heard by 5 gateways
+  costs the node 5 packets, not 1).
+- The caps of the bounded tables are configuration, not constants: `max_tracked_entries` (100000) is the cap
+  of the per-IP, the per-client and the per-node rate tables, of the table of failed logins and of the
+  table of bans, and `rate_idle_expiry_seconds` (600) is how long an entry of a rate table survives without
+  being used.
 
 The order of the checks in the publish hook is fixed: **publish ACL → payload cap → per-client rate →
 packet filter (including the gateway binding) → dedupe → per-node rate**. Every refusal is counted under
@@ -245,13 +261,19 @@ of the topic must be the `gateway_id` of the envelope, and it must be `!` follow
 (`NodeDB::getNodeId()`, the same string the firmware puts in both places, `src/mqtt/MQTT.cpp` `onSend()`).
 A topic whose gateway is something else is dropped (`gateway in topic does not match gateway_id`).
 
-Every table the broker keeps (per IP, per client, per node, per packet) has a hard entry cap and an idle
-expiry (the per-IP connection counter dies with its connection instead), and the evictions are counted (and
-counted again in the periodic summary, see [Logs](#logs)), so a flood of forged ids cannot grow the memory
-without bound.
+Every table the broker keeps (per IP, per client, per node, per packet) has a hard entry cap
+(`max_tracked_entries`, or `dedupe_max_entries` for the dedupe) and an idle expiry
+(`rate_idle_expiry_seconds`; the per-IP connection counter dies with its connection instead), and the
+evictions are counted (and counted again in the periodic summary, see [Logs](#logs)), so a flood of
+forged ids cannot grow the memory without bound.
 
 #### Residual risks
 
+- **A client can restart its per-client budget by reconnecting.** The publish budget belongs to the
+  session, so a client that reconnects gets a full one again. The per-IP connect rate is what bounds it:
+  with the defaults (30 connections per minute per address and a burst of 60 publishes), one address can
+  spend about **30 × 60 = 1800 publishes per minute**. Lower `connect_rate_per_ip_per_minute` or lower
+  `publish_burst_per_client` if that is too much.
 - **With public credentials, a forged `from` can use up a real node's budget.** `meshdev`/`large4cats` are
   public, so anyone can put any `from` in an envelope header and spend that node's per-node packet budget.
   The per-client and per-IP limits bound how much of that an attacker can do at once, but they cannot tell
@@ -289,8 +311,9 @@ system fail2ban, no nftables, no changes to the host.
   are never banned. An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) matches the IPv4 ranges.
 - The bans are in memory: **a restart forgets them**. There is no manual unban.
 
-The tables behind it are bounded (100000 addresses each): the failed logins are evicted oldest first, the
-bans evict the one that ends soonest, and the evictions are counted in the periodic summary.
+The tables behind it are bounded (`max_tracked_entries`, 100000 addresses each): the failed logins are
+evicted oldest first, the bans evict the one that ends soonest, and the evictions are counted in the
+periodic summary.
 
 #### Residual risks
 
@@ -310,21 +333,25 @@ bans evict the one that ends soonest, and the evictions are counted in the perio
 Logs never contain passwords or message payloads. At the default `information` level:
 
 - Connections, granted subscriptions and the startup line: Information.
-- Failed logins: Warning, one line per attempt with username and remote IP (the format fail2ban will
-  read): `Authentication failed for user {Username} from {RemoteIp} (client {ClientId})`. Refused
-  authentication methods, client-id conflicts and "server busy" refusals are also Warning with username and IP.
+- Failed logins: Warning, one line per attempt with username and remote IP. The broker counts the
+  failures itself and bans the address (see [Auth bans](#auth-bans)): the Warnings are for the operators.
+  Refused authentication methods, client-id conflicts and "server busy" refusals are also Warning with
+  username and IP.
 - A ban is one Warning when it starts: `Banned {RemoteIp} for {Seconds} s after {Failures} authentication
   failures`. The connections of a banned address are Debug (one per connection) and are counted in the
   summary as `banned IP`.
 - A refused SUBSCRIBE: one Warning per packet (count of refused filters and the first one), however many
   filters it carries.
-- Dropped publishes: one Information line every 60 s with the number of drops per reason, only when
-  something was dropped. Publishes refused by the publish ACL are counted there too (`not in publish_allow`,
-  `invalid topic name`), and so are the ones refused by the limits and the dedupe
+- Dropped publishes: one Information line every 60 s with the number of refusals and evictions per reason,
+  only when something was refused. The line is `Refused or evicted {Total} in the last 60 s: {reason}:
+  {count}, ...`: it counts more than dropped publishes, so it does not call them all publishes. Publishes
+  refused by the publish ACL are counted there too (`not in publish_allow`, `invalid topic name`), and so
+  are the ones refused by the limits and the dedupe
   (`payload larger than max_payload_size`, `publish rate exceeded for the client`,
   `duplicate from the same gateway`, `too many gateways for one packet`, `packet rate exceeded for the node`)
   and the connections refused at the accept (`too many connections from one IP`,
-  `too many connection attempts from one IP`). Each dropped packet is logged individually only at `debug`.
+  `too many connection attempts from one IP`, `banned IP`). Each dropped packet is logged individually
+  only at `debug`.
 - Evictions from the bounded tables are counted in the same summary, one reason per table:
   `evicted: dedupe table full`, `evicted: per-node rate table full`, `evicted: per-client rate table full`,
   `evicted: per-IP connection table full`, `evicted: per-IP rate table full`,
