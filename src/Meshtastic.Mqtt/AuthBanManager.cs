@@ -22,10 +22,11 @@ namespace Meshtastic.Mqtt;
 /// (CGNAT, VPN) would keep the guesses alive.
 /// </para>
 /// <para>
-/// Both tables are bounded (<c>limits.max_tracked_entries</c>): the failures are evicted oldest first, the
-/// bans evict the one that ends soonest. They also expire by themselves: an amortized sweep forgets the
-/// failures whose window has passed and the bans that have ended, so a flood of failures from many
-/// rotating addresses leaves nothing behind. The state is in memory only: a restart forgets every ban.
+/// Both tables are bounded (<c>limits.max_tracked_entries</c>): the failures are evicted in the order of
+/// their windows (the oldest window first), the bans evict the one that ends soonest. They also expire by
+/// themselves: an amortized sweep forgets the failures whose window has passed and the bans that have
+/// ended, so a flood of failures from many rotating addresses leaves nothing behind. The state is in
+/// memory only: a restart forgets every ban.
 /// </para>
 /// </remarks>
 public sealed class AuthBanManager
@@ -159,7 +160,6 @@ public sealed class AuthBanManager
         if (_maxFailures <= 0)
             return false;   // the bans are off
 
-        bool banned;
         int failures;
         lock (_lock)
         {
@@ -181,9 +181,11 @@ public sealed class AuthBanManager
             }
             else if (now - failure.WindowStart > _windowTicks)
             {
-                // The window has passed: this failure starts a new one.
+                // The window has passed: this failure starts a new one. The entry goes to the tail of
+                // the order, so the order of the table stays the order of the windows.
                 failure.WindowStart = now;
                 failure.Count = 0;
+                _failures.Touch(ip);
             }
 
             failure.Count++;
@@ -193,7 +195,6 @@ public sealed class AuthBanManager
             // The limit is reached: the address is banned and its counter is cleared.
             _failures.Remove(ip);
             StartBanLocked(ip, now);
-            banned = true;
             failures = failure.Count;
         }
 
@@ -258,6 +259,9 @@ public sealed class AuthBanManager
     /// <summary>Addresses evicted from the failure table to stay under the cap (for tests).</summary>
     public long FailureEvictions => _failures.Evictions;
 
+    /// <summary>The failures the sweeps have visited so far (for tests).</summary>
+    internal long FailureSweepVisits => _failures.Visits;
+
     /// <summary>Bans evicted from the ban table to stay under the cap (for tests).</summary>
     public long BanEvictions => Interlocked.Read(ref _banEvictions);
 
@@ -299,35 +303,21 @@ public sealed class AuthBanManager
         _insertsSinceSweep = 0;
 
         // The failures whose window has passed are forgotten: an address that fails again starts a new one.
-        foreach (var ip in _failures.Keys())
-        {
-            if (_failures.TryGet(ip, out var failure) && now - failure.WindowStart > _windowTicks)
-                _failures.Remove(ip);
-        }
+        // The order of the table is the order of the windows (a failure that starts a new window goes to
+        // the tail), so the sweep costs what it expires, not what the table holds.
+        _failures.RemoveOldestWhile((_, failure) => now - failure.WindowStart > _windowTicks);
 
         // The bans that have ended are forgotten, and logged like the lazy path does. The queue is
-        // ordered by the moment the bans end, so its head says whether any of them has ended.
-        if (_bansByExpiry.TryPeek(out _, out var nextExpiry) && nextExpiry <= now)
+        // ordered by the moment the bans end, so its head says whether any of them has ended: the head
+        // is drained while it has ended. The entry of a ban that was replaced, or that the lazy path
+        // already forgot, is stale: the live ban of that address is left alone.
+        while (_bansByExpiry.TryPeek(out var ip, out var expiry) && expiry <= now)
         {
-            List<string>? ended = null;
-            foreach (var (ip, ban) in _bans)
-            {
-                if (now >= ban.ExpiresAt)
-                    (ended ??= []).Add(ip);
-            }
-            if (ended is not null)
-            {
-                foreach (var ip in ended)
-                {
-                    _bans.Remove(ip);
-                    _log.Debug("Ban for {RemoteIp} ended", ip);
-                }
-            }
-
-            // The entries of the bans that have ended are the oldest ones (the queue is ordered by the
-            // moment they end), so they are dropped from its head.
-            while (_bansByExpiry.TryPeek(out _, out var expiry) && expiry <= now)
-                _bansByExpiry.Dequeue();
+            _bansByExpiry.Dequeue();
+            if (!_bans.TryGetValue(ip, out var ban) || ban.ExpiresAt != expiry)
+                continue;   // a stale entry: the ban was replaced or has already ended
+            _bans.Remove(ip);
+            _log.Debug("Ban for {RemoteIp} ended", ip);
         }
     }
 

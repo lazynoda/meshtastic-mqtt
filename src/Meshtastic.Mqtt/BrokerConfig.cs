@@ -416,36 +416,56 @@ public sealed class LimitsConfig
     /// "key=value, key=value, ...". The exempt ranges are listed as they are written in the config, so
     /// the operator sees the whole configuration in one line.
     /// </summary>
+    /// <remarks>
+    /// The line is built from <see cref="EffectiveValues"/>, so there is one source of truth: the
+    /// dictionary the startup log attaches and the text of the line never disagree.
+    /// </remarks>
     public string Describe() => string.Join(", ",
-        $"max_packet_size={MaxPacketSize ?? DefaultMaxPacketSize}",
-        $"communication_timeout_seconds={CommunicationTimeoutSeconds ?? DefaultCommunicationTimeoutSeconds}",
-        $"auth_queue_timeout_seconds={AuthQueueTimeoutSeconds ?? DefaultAuthQueueTimeoutSeconds}",
-        $"auth_max_pending={AuthMaxPending ?? DefaultAuthMaxPending}",
-        $"auth_max_pending_per_user={AuthMaxPendingPerUser ?? DefaultAuthMaxPendingPerUser}",
-        $"max_connections_per_ip={MaxConnectionsPerIp ?? DefaultMaxConnectionsPerIp}",
-        $"connect_rate_per_ip_per_minute={ConnectRatePerIpPerMinute ?? DefaultConnectRatePerIpPerMinute}",
-        $"connect_burst_per_ip={ConnectBurstPerIp ?? DefaultConnectBurstPerIp}",
-        $"max_payload_size={MaxPayloadSize ?? DefaultMaxPayloadSize}",
-        $"publish_rate_per_client_per_minute={PublishRatePerClientPerMinute ?? DefaultPublishRatePerClientPerMinute}",
-        $"publish_burst_per_client={PublishBurstPerClient ?? DefaultPublishBurstPerClient}",
-        $"dedupe_window_seconds={DedupeWindowSeconds ?? DefaultDedupeWindowSeconds}",
-        $"dedupe_max_gateways_per_packet={DedupeMaxGatewaysPerPacket ?? DefaultDedupeMaxGatewaysPerPacket}",
-        $"dedupe_max_entries={DedupeMaxEntries ?? DefaultDedupeMaxEntries}",
-        $"packet_rate_per_from_per_minute={PacketRatePerFromPerMinute ?? DefaultPacketRatePerFromPerMinute}",
-        $"packet_burst_per_from={PacketBurstPerFrom ?? DefaultPacketBurstPerFrom}",
-        $"auth_fail_max_per_ip={AuthFailMaxPerIp ?? DefaultAuthFailMaxPerIp}",
-        $"auth_fail_window_seconds={AuthFailWindowSeconds ?? DefaultAuthFailWindowSeconds}",
-        $"auth_ban_seconds={AuthBanSeconds ?? DefaultAuthBanSeconds}",
-        $"auth_ban_exempt={DescribeExempt()}",
-        $"max_tracked_entries={MaxTrackedEntries ?? DefaultMaxTrackedEntries}",
-        $"rate_idle_expiry_seconds={RateIdleExpirySeconds ?? DefaultRateIdleExpirySeconds}");
+        EffectiveValues().Select(entry => $"{entry.Key}={DescribeValue(entry.Value)}"));
 
-    /// <summary>The exempt ranges as they are written in the config (an empty list as "[]").</summary>
-    string DescribeExempt()
+    /// <summary>
+    /// Every limit with the value the broker will use (the value of the config, or the default when it
+    /// is not set), in the order the startup line shows them. The exempt ranges are a list of strings.
+    /// </summary>
+    /// <remarks>
+    /// The order is the order of the keys as they are added: the dictionary is an ordered one, so the
+    /// order is part of its type and not of the enumeration of a plain dictionary. The startup log
+    /// attaches it as a structured property, so the log store keeps the limits of that run as data and
+    /// not only as text.
+    /// </remarks>
+    public IReadOnlyDictionary<string, object> EffectiveValues()
     {
-        var ranges = AuthBanExempt;
-        return ranges is { Count: > 0 } ? "[" + string.Join(", ", ranges) + "]" : "[]";
+        var values = new OrderedDictionary<string, object>(StringComparer.Ordinal)
+        {
+            ["max_packet_size"] = MaxPacketSize ?? DefaultMaxPacketSize,
+            ["communication_timeout_seconds"] = CommunicationTimeoutSeconds ?? DefaultCommunicationTimeoutSeconds,
+            ["auth_queue_timeout_seconds"] = AuthQueueTimeoutSeconds ?? DefaultAuthQueueTimeoutSeconds,
+            ["auth_max_pending"] = AuthMaxPending ?? DefaultAuthMaxPending,
+            ["auth_max_pending_per_user"] = AuthMaxPendingPerUser ?? DefaultAuthMaxPendingPerUser,
+            ["max_connections_per_ip"] = MaxConnectionsPerIp ?? DefaultMaxConnectionsPerIp,
+            ["connect_rate_per_ip_per_minute"] = ConnectRatePerIpPerMinute ?? DefaultConnectRatePerIpPerMinute,
+            ["connect_burst_per_ip"] = ConnectBurstPerIp ?? DefaultConnectBurstPerIp,
+            ["max_payload_size"] = MaxPayloadSize ?? DefaultMaxPayloadSize,
+            ["publish_rate_per_client_per_minute"] = PublishRatePerClientPerMinute ?? DefaultPublishRatePerClientPerMinute,
+            ["publish_burst_per_client"] = PublishBurstPerClient ?? DefaultPublishBurstPerClient,
+            ["dedupe_window_seconds"] = DedupeWindowSeconds ?? DefaultDedupeWindowSeconds,
+            ["dedupe_max_gateways_per_packet"] = DedupeMaxGatewaysPerPacket ?? DefaultDedupeMaxGatewaysPerPacket,
+            ["dedupe_max_entries"] = DedupeMaxEntries ?? DefaultDedupeMaxEntries,
+            ["packet_rate_per_from_per_minute"] = PacketRatePerFromPerMinute ?? DefaultPacketRatePerFromPerMinute,
+            ["packet_burst_per_from"] = PacketBurstPerFrom ?? DefaultPacketBurstPerFrom,
+            ["auth_fail_max_per_ip"] = AuthFailMaxPerIp ?? DefaultAuthFailMaxPerIp,
+            ["auth_fail_window_seconds"] = AuthFailWindowSeconds ?? DefaultAuthFailWindowSeconds,
+            ["auth_ban_seconds"] = AuthBanSeconds ?? DefaultAuthBanSeconds,
+            ["auth_ban_exempt"] = AuthBanExempt ?? new List<string>(),
+            ["max_tracked_entries"] = MaxTrackedEntries ?? DefaultMaxTrackedEntries,
+            ["rate_idle_expiry_seconds"] = RateIdleExpirySeconds ?? DefaultRateIdleExpirySeconds,
+        };
+        return values;
     }
+
+    /// <summary>The value as the startup line shows it (the exempt ranges as the list they are in).</summary>
+    static string DescribeValue(object value) =>
+        value is List<string> ranges ? "[" + string.Join(", ", ranges) + "]" : value.ToString() ?? string.Empty;
 }
 
 public sealed class UserConfig

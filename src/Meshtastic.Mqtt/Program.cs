@@ -77,12 +77,10 @@ static class Cli
             return 1;
         }
 
-        var limits = config.Limits!;
         // Every limit of the configuration is on this line, so the operator sees what the broker is
-        // running with (the exempt ranges are listed, not counted).
-        logger.Information("Listening on {Address}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_undecryptable={DropUndecryptable}, drop_pki={DropPki}, limits: {Limits}",
-            config.BindAddress, config.Listener.Port, config.Users!.Count, config.ChannelKeyMap.Count, config.DropUndecryptable, config.DropPki,
-            limits.Describe());
+        // running with (the exempt ranges are listed, not counted). The limits are also attached as a
+        // structured property, so the log store keeps them as data and not only as text.
+        StartupLine.Write(logger, config);
 
         await stop.Task;
         logger.Information("Shutting down");

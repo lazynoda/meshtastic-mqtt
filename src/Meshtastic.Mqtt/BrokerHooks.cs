@@ -197,7 +197,8 @@ public sealed class BrokerHooks
             var auth = await _authenticator.AuthenticateAsync(args.UserName, args.RawPassword, args.CancellationToken).ConfigureAwait(false);
             if (auth == AuthResult.Busy)
             {
-                // Not an authentication failure (the password was not checked), so worded differently for fail2ban.
+                // Not an authentication failure: the password was not checked, so the refusal is worded
+                // differently and it does not count towards the in-broker ban.
                 args.ReasonCode = MqttConnectReasonCode.ServerBusy;
                 _log.Warning("Connection refused: password check queue full, retry later (user {Username} from {RemoteIp}, client {ClientId})",
                     Trim(args.UserName), remote, Trim(args.ClientId));

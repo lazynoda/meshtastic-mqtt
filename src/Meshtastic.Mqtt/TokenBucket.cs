@@ -50,7 +50,9 @@ public struct TokenBucket
 /// <remarks>
 /// Used for every table the broker keeps about clients, so a flood of forged keys cannot grow the memory
 /// without bound. The order is the insertion order (first seen first evicted); an entry that is replaced
-/// keeps its place.
+/// keeps its place. The tables whose entries expire by idle time (the rate tables) call
+/// <see cref="Touch"/> on every use: their order is the order of the last use, so the entry that is
+/// evicted when the map is full is the least recently used one.
 /// </remarks>
 internal sealed class BoundedMap<TKey, TValue> where TKey : notnull
 {
@@ -128,6 +130,26 @@ internal sealed class BoundedMap<TKey, TValue> where TKey : notnull
     }
 
     /// <summary>
+    /// Moves an entry to the tail of the order: it is the most recently used one. Nothing happens when
+    /// the key is not in the map.
+    /// </summary>
+    /// <remarks>
+    /// The tables that expire their entries by idle time call it on every use, so their order is the
+    /// order of the last use: the sweep and the eviction work on the least recently used entries first.
+    /// It is O(1): the node is unlinked and linked again at the tail.
+    /// </remarks>
+    public void Touch(TKey key)
+    {
+        if (!_map.TryGetValue(key, out var node))
+            return;
+        var order = node.Order;
+        if (order is null)
+            return;
+        _order.Remove(order);
+        _order.AddLast(order);
+    }
+
+    /// <summary>
     /// A snapshot of the keys (for sweeps). The caller holds the table's lock: the snapshot is taken
     /// under it, and the table is not modified while it is being taken.
     /// </summary>
@@ -141,7 +163,8 @@ internal sealed class BoundedMap<TKey, TValue> where TKey : notnull
 
     /// <summary>
     /// Removes the entries at the head of the order while the predicate holds, and stops at the first
-    /// entry that does not: the order is the insertion order, so the entries that are over are the
+    /// entry that does not: the order is the order the map keeps (the insertion order, or the order of
+    /// the last use for the tables that touch their entries), so the entries that are over are the
     /// oldest ones and a sweep costs what it expires, not what the table holds.
     /// </summary>
     /// <param name="shouldRemove">Told the key and the value of each entry, oldest first.</param>
@@ -173,6 +196,12 @@ internal sealed class BoundedMap<TKey, TValue> where TKey : notnull
 /// Idle buckets are swept away and the table never grows past its cap, so a flood of forged keys (a client
 /// id, a node number, an IP) cannot grow the memory without bound. Every update happens under one lock, so
 /// MQTTnet's concurrent handlers cannot take a token twice or lose one.
+/// <para>
+/// The order of the table is the order of the last use: every key that takes a token goes to the tail of
+/// the order, so the sweep and the eviction work on the least recently used keys first. The consequence
+/// accepted for this table is that the key evicted when it is full is the least recently used one, not
+/// the first inserted.
+/// </para>
 /// </remarks>
 public sealed class TokenBucketTable
 {
@@ -220,6 +249,9 @@ public sealed class TokenBucketTable
     /// <summary>Entries evicted to stay under the cap.</summary>
     public long Evictions => _buckets.Evictions;
 
+    /// <summary>The entries the sweeps have visited so far (for tests).</summary>
+    internal long SweepVisits => _buckets.Visits;
+
     /// <summary>Takes one token for <paramref name="key"/>; false when the bucket is empty.</summary>
     public bool TryTake(string key)
     {
@@ -237,6 +269,9 @@ public sealed class TokenBucketTable
             {
                 entry.LastUsed = now;
             }
+            // The key is the most recently used one: it goes to the tail of the order, so the order is
+            // the order of the last use.
+            _buckets.Touch(key);
             return entry.Bucket.TryTake(now, _time.TimestampFrequency, _refillPerSecond, _capacity);
         }
     }
@@ -256,11 +291,9 @@ public sealed class TokenBucketTable
         if (now - _lastSweepTicks < expiry / 4)
             return;
         _lastSweepTicks = now;
-        foreach (var key in _buckets.Keys())
-        {
-            if (_buckets.TryGet(key, out var entry) && now - entry.LastUsed > expiry)
-                _buckets.Remove(key);
-        }
+        // The order is the order of the last use, so the idle keys are the ones at the head of the order:
+        // the sweep costs what it expires, not what the table holds.
+        _buckets.RemoveOldestWhile((_, entry) => now - entry.LastUsed > expiry);
     }
 }
 
@@ -270,6 +303,12 @@ public sealed class TokenBucketTable
 /// <remarks>
 /// A client id taken over by another user starts with a fresh budget (the key is the pair, not the id
 /// alone). The state dies with the session (see <see cref="Remove"/>) and with the idle expiry.
+/// <para>
+/// The order of the table is the order of the last use: every client that takes a token goes to the tail
+/// of the order (a client id taken over by another user too), so the sweep and the eviction work on the
+/// least recently used clients first. The consequence accepted for this table is that the client evicted
+/// when it is full is the least recently used one, not the first inserted.
+/// </para>
 /// </remarks>
 public sealed class ClientRateTable
 {
@@ -315,6 +354,9 @@ public sealed class ClientRateTable
     /// <summary>Entries evicted to stay under the cap.</summary>
     public long Evictions => _entries.Evictions;
 
+    /// <summary>The entries the sweeps have visited so far (for tests).</summary>
+    internal long SweepVisits => _entries.Visits;
+
     /// <summary>Takes one token for the (owner, client id) pair; false when the bucket is empty.</summary>
     public bool TryTake(string owner, string clientId)
     {
@@ -333,6 +375,9 @@ public sealed class ClientRateTable
             {
                 entry.LastUsed = now;
             }
+            // The client is the most recently used one: it goes to the tail of the order (a client id
+            // taken over by another user too), so the order is the order of the last use.
+            _entries.Touch(clientId);
             return entry.Bucket.TryTake(now, _time.TimestampFrequency, _refillPerSecond, _capacity);
         }
     }
@@ -352,10 +397,8 @@ public sealed class ClientRateTable
         if (now - _lastSweepTicks < expiry / 4)
             return;
         _lastSweepTicks = now;
-        foreach (var key in _entries.Keys())
-        {
-            if (_entries.TryGet(key, out var entry) && now - entry.LastUsed > expiry)
-                _entries.Remove(key);
-        }
+        // The order is the order of the last use, so the idle clients are the ones at the head of the
+        // order: the sweep costs what it expires, not what the table holds.
+        _entries.RemoveOldestWhile((_, entry) => now - entry.LastUsed > expiry);
     }
 }
