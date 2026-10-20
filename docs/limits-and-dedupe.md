@@ -19,21 +19,10 @@ has no such limit and would allocate whatever a client announces (up to 256 MB) 
 is why the check runs in the broker's own TCP listener, on the raw bytes (see
 [The packet-size cap](security.md#the-packet-size-cap)).
 
-Logins pay PBKDF2 only when the password is not already known (see
-[The password queue](security.md#the-password-queue)). Those checks run in two queues, one for configured
-usernames and one for unknown usernames, each bounded by `auth_max_pending` and
-`auth_queue_timeout_seconds`, so a flood of bad logins can neither grow memory without bound nor keep
-legitimate users waiting. Within the configured-users queue, checks are grouped by username and the
-usernames are served in turn (round-robin), and one username may have at most
-`auth_max_pending_per_user` distinct checks pending; beyond that its logins get "server busy" at once.
-Wrong passwords for the public `meshdev` user therefore delay another user's cold login by at most one
-check, however many guesses arrive and however many times each guess is sent. Simultaneous logins with the
-same username and password (a fleet of `meshdev` nodes reconnecting after a broker restart) share one
-PBKDF2 computation, and within a username the check with the most logins waiting on it runs first, so the
-real `meshdev` password jumps ahead of an attacker's guesses. What the queue cannot do is tell a lone cold
-`meshdev` login from a guess before hashing it: while `meshdev`'s own checks are all taken by guesses, that
-login is told "server busy" and retries. Limiting such a flood is a per-IP job (the per-IP connect rate,
-below).
+Logins pay PBKDF2 only when the password is not already known, and the checks run in two bounded
+queues, one for the configured usernames and one for the unknown usernames. What that queue does, and
+what it cannot do, is in [The password queue](security.md#the-password-queue). Limiting a flood of bad
+logins is a per-IP job (the per-IP connect rate, below).
 
 ### How the token buckets work here
 

@@ -96,14 +96,27 @@ code: a key that is added to the config classes and not to `docs/configuration.m
 
 ## Upgrading
 
-The config file is the only thing that has to change between the versions of this broker, and there has
-been **one breaking change** so far:
+The config file is the only thing that has to change between the versions of this broker, and there have
+been **two breaking changes** so far:
 
 - **The publish ACL.** A config written before the publish ACL existed has no `publish_allow` for its
   users, and an empty or missing list means **no publish at all**. Such a config starts, the nodes
   connect, and nothing is forwarded: the broker counts every publish as `not in publish_allow` and the
   60 s summary says so. Give every user that must publish an explicit list, as in
   [`config.example.yaml`](../config.example.yaml).
+- **The removed `drop_undecryptable`.** The global flag is gone: it moved to `users[].forward_unopened`,
+  with the **inverted** meaning. A config that still has `drop_undecryptable` does not start, and the
+  error says so:
+
+  ```
+  Invalid config '/config/config.yaml':
+  drop_undecryptable: removed; it moved to users[].forward_unopened, with the inverted meaning: forward_unopened: true (the default) forwards the packets the broker cannot open, and false drops them
+  ```
+
+  Delete the key and decide per user: `forward_unopened: true` (the default) forwards the packets the
+  broker cannot open, unchanged, and `forward_unopened: false` drops them, as `drop_undecryptable: true`
+  did. The key belongs to a user, not to the broker: two users of the same broker can have two different
+  policies.
 
 Every other key has a default, so a config that does not mention it keeps working: the limits, the bans
 and the packet filter are on with their defaults, and a config written for an older version of the

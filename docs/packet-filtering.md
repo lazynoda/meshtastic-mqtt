@@ -24,10 +24,13 @@ A channel packet is forwarded only if all of these hold:
 5. The packet has a non-zero `from` and a non-zero `id`, and it carries an `encrypted` payload of 1 to 256
    bytes (a plaintext `decoded` packet is dropped).
 6. The key of the channel is looked up **by channel name** (`channels`, falling back to `default_psk`) and
-   the packet decrypts with it. The lookup is case-sensitive, like the firmware: the channel hash covers
-   the exact name, so `Test` and `test` are different channels, and a `test` channel that is not listed
-   under `channels` uses `default_psk`. A packet that does not decrypt is dropped when
-   `drop_undecryptable` is `true` (the default).
+   the packet decrypts with it, **or the user that published it forwards the packets the broker cannot
+   open**. The lookup is case-sensitive, like the firmware: the channel hash covers the exact name, so
+   `Test` and `test` are different channels, and a `test` channel that is not listed under `channels` uses
+   `default_psk`. A packet that does not decrypt is forwarded unchanged, unless that user has
+   `forward_unopened: false`, which drops it with the reason
+   `undecryptable with the key configured for this channel` (see
+   [The packets the broker cannot open](#the-packets-the-broker-cannot-open)).
 7. The packet is not a PKI direct message, unless `drop_pki` is `false` (see below).
 
 A map report is forwarded only if it passes its own checks (see [Map reports](#map-reports)).
@@ -65,8 +68,6 @@ sender's node number). It counts as decryptable when the result parses as a `Dat
 than `UNKNOWN_APP`, which is the firmware's own test (`Router.cpp`, `perhapsDecode()`). **The keys are
 never tried one after another**: the channel of the topic names the one key that is used.
 
-A packet that does not decrypt is dropped when `drop_undecryptable` is `true` (the default).
-
 The firmware also computes a channel hash for the configured key and sends it in clear in
 `MeshPacket.channel`. The broker computes it too, and a mismatch is logged at `debug` level only: it never
 causes a drop.
@@ -92,22 +93,34 @@ The channels of the Spanish mesh (source: meshtastic-es-community.github.io):
 | `Test`, `Bots` | `Ag==` |
 | `Valencia` | `VA==` |
 
-## drop_undecryptable and drop_pki
+## The packets the broker cannot open
 
-The two flags of the top level of the config decide what happens to the packets the broker cannot make
-sense of. Both are `true` by default.
+A channel packet whose key the broker does not have is **forwarded unchanged**: the bytes the client
+published reach the subscribers as they are, and the broker does not read them. It is a private channel,
+a wrong key or garbage, and it happens when a channel of the mesh is not listed under `channels` (the
+broker then only has `default_psk`) or when the key of the channel does not open the packet.
 
-### drop_undecryptable
+What happens to those packets is decided **per user**, with `users[].forward_unopened`:
 
-A channel packet that does not decrypt with the key of its channel is dropped with the reason
-`undecryptable with the key configured for this channel`. It is a private channel, a wrong key or
-garbage.
+| `forward_unopened` | What the broker does with a packet it cannot open |
+|---|---|
+| `true` (the default) | It forwards the packet unchanged, and it writes one `debug` line per packet. |
+| `false` | It drops the packet, with the reason `undecryptable with the key configured for this channel`. |
 
-With `drop_undecryptable: false` the packet is forwarded undecrypted, and the log line says
-`undecryptable, passed (drop_undecryptable: false)`. Only do that when you must see the traffic of a
-channel whose key you do not have.
+The user is the one that **owns the session**, the same identity the publish ACL uses, never the
+`username` of the PUBLISH.
 
-### drop_pki
+A forwarded packet is not a refusal: **every other check still applies to it**, in the same order as to
+any other packet (the publish ACL, the topic layout and its root, the `/json/` block, the channel of the
+topic, the gateway binding, the size caps, the rates and the dedupe). Only the verdict of the decryption
+changes. The packet is not counted in the 60 s summary, and the `debug` line says the channel, the
+`from`, the id of the packet and why it was not opened (no key for the channel, or a key that does not
+open it).
+
+With `forward_unopened: false` the packet is dropped with the reason `undecryptable with the key
+configured for this channel`, and the drop is counted in the 60 s summary like any other.
+
+## drop_pki
 
 A packet that is PKI-encrypted (Curve25519 and AES-CCM, end to end between two nodes) is uplinked
 **still encrypted**, with `channel_id = "PKI"` on the topic `<root>/2/e/PKI/<gateway>`, and only when the
@@ -115,7 +128,7 @@ gateway has "encryption enabled" on its MQTT module. The gateways subscribe to `
 accept those packets for downlink even though they cannot decrypt them either.
 
 The broker can never decrypt them, so they have their own flag instead of falling under
-`drop_undecryptable`:
+`forward_unopened`:
 
 - `drop_pki: true` (the default) drops them. The broker is uplink-only, so nothing would consume them;
   dropping them means they are not exposed to every future downlink subscriber, and their metadata (who
@@ -216,13 +229,16 @@ Inside the packet filter, the checks of a channel packet are in this order:
 6. The envelope has a `channel_id` and a `gateway_id` (`envelope without channel_id or gateway_id`).
 7. The packet has a non-zero `from` and a non-zero `id` (`packet without from or id`).
 8. The packet carries an `encrypted` payload of 1-256 bytes (`packet is not encrypted`,
-   `encrypted payload size N outside 1-256`); a plaintext `decoded` packet is dropped.
+   `encrypted payload size N outside N-N`); a plaintext `decoded` packet is dropped.
 9. The `channel_id` of the envelope equals the `<channel>` level of the topic
    (`channel_id does not match the topic`).
 10. The `<gateway>` level of the topic equals the `gateway_id` of the envelope, and it is a node id
     (`gateway in topic does not match gateway_id`).
 11. The channel of the packet is `PKI` (then the PKI checks apply), or it is a channel packet: the key is
-    looked up by name and the packet is decrypted (`undecryptable with the key configured for this channel`).
+    looked up by name and the packet is decrypted. A packet that does not decrypt is forwarded unchanged
+    when the user that published it forwards those packets
+    ([The packets the broker cannot open](#the-packets-the-broker-cannot-open)), and dropped with the
+    reason `undecryptable with the key configured for this channel` when it does not.
 
 ## See also
 

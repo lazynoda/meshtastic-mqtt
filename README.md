@@ -19,7 +19,7 @@ remain in the git history: they were always public, they are expired, and they m
 
 - [Authentication](docs/security.md#authentication) with PBKDF2-SHA256 password hashes, compared in constant time.
 - [Subscribe and publish ACLs](docs/security.md#the-acls) per user: an empty list means no access at all.
-- [No downlink by default](docs/security.md#the-acls): only the filters of the `subscribe_allow`, and the public `meshdev` user gets none.
+- [No downlink by default](docs/security.md#the-acls): a user only gets the filters of its own `subscribe_allow`, and the public `meshdev` user gets none.
 - [Client-id ownership](docs/security.md#client-id-ownership): an id held by another user's session is refused.
 - [A packet-size cap](docs/security.md#the-packet-size-cap) in the TCP listener, before the packet is allocated.
 - [The retain flag is always cleared](docs/security.md#retain-is-always-cleared), so nothing enters the retained-message store.
@@ -27,8 +27,8 @@ remain in the git history: they were always public, they are expired, and they m
 ### Packet filtering
 
 - [Channel keys](docs/packet-filtering.md#channel-keys) by the exact channel name, like the firmware.
-- [Undecryptable and PKI packets are dropped](docs/packet-filtering.md#drop_undecryptable-and-drop_pki) by default.
-- [Empty, malformed, plaintext and undecryptable packets are dropped](docs/packet-filtering.md#publish-filtering).
+- [The packets the broker cannot open are forwarded unchanged](docs/packet-filtering.md#the-packets-the-broker-cannot-open) per user, on by default, and the PKI packets are dropped by default.
+- [Empty, malformed and plaintext packets are dropped](docs/packet-filtering.md#publish-filtering).
 - [The `/json/` and the malformed topics are dropped](docs/packet-filtering.md#topics-the-broker-drops).
 - [Map reports are validated](docs/packet-filtering.md#map-reports) before they are forwarded.
 - [The gateway of the topic must match the envelope](docs/packet-filtering.md#gateway-binding).
@@ -58,7 +58,8 @@ remain in the git history: they were always public, they are expired, and they m
 - **Subscribe**: the filter is granted only if every topic it can match is covered by the
   `subscribe_allow` of the user that created the session. An empty list denies everything.
 - **Publish**: the publish ACL, then the limits, then the packet filter. A refused publish is dropped,
-  never forwarded, and the client stays connected.
+  never forwarded, and the client stays connected; a packet the broker cannot open is forwarded unchanged,
+  unless the user drops those packets (see [Packet filtering](docs/packet-filtering.md#the-packets-the-broker-cannot-open)).
 
 The rules of the three hooks are in [Architecture](docs/architecture.md#what-it-does-with-each-connection).
 

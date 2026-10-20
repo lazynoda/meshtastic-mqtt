@@ -56,11 +56,11 @@ The only sign of it is on the broker: the 60 s summary counts the refusals under
 root to `msh/<REGION>`, but only under conditions that do not hold for a node that points at another
 server:
 
-- in firmware 2.8, the root is rewritten only when the server is still the default
+- since firmware 2.8.1, the root is rewritten only when the server is still the default
   `mqtt.meshtastic.org` (or empty) **and** the root is still a default one (`msh` or `msh/<any region>`);
   a node that points at another server keeps the root it was given;
-- in firmware 2.7, the root was rewritten when the region changed and the root started with `msh`,
-  whatever the server was.
+- in firmware 2.7 and in 2.8.0, the root was rewritten when the region changed and the root started with
+  `msh`, whatever the server was.
 
 Either way, set `msh/EU_868` by hand, and check it after a firmware update.
 
@@ -103,8 +103,8 @@ packet, and the broker drops it: a channel packet has to carry an encrypted payl
 
 The channel key is the one of the channel, and the broker knows the keys of the channels of the mesh (see
 [Channel keys](packet-filtering.md#channel-keys)). A packet of a channel whose key the broker does not
-have is dropped as `undecryptable with the key configured for this channel`, unless
-`drop_undecryptable` is turned off in the config.
+have is forwarded unchanged, as every packet the broker cannot open is (see
+[The packets the broker cannot open](packet-filtering.md#the-packets-the-broker-cannot-open)).
 
 ## What not to do
 
