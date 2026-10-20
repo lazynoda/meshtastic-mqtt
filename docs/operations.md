@@ -36,6 +36,10 @@ docker logs -f meshtastic-mqtt
   other checks is forwarded. [`filters.example.yaml`](../filters.example.yaml) is an illustration of
   every feature of the rules file, **not a starting point**: copied as it is, it drops every text
   message and every packet the broker cannot open. Copy the rules you need, not the example.
+- The `filters:` section of [`config.example.yaml`](../config.example.yaml) is **commented out**, so
+  the empty file is only read when that section is uncommented in `config.yaml`. With the section, the
+  startup line says `filters=on (0 rules)` (the file is empty, so it holds no rules); without it, the
+  line says `filters=off`.
 
 The image needs one thing: a config file. There is no other secret in it, and nothing is baked into the
 image.

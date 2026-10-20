@@ -144,6 +144,9 @@ a `lt` on a text. The values are checked too: the value of a number field has to
 of a boolean field `true` or `false`, and the value of an enum field the name of a value of the enum
 or its number.
 
+The value compared with `data.portnum` has to be a portnum of the firmware (0 to 511), whatever the
+operator is (`eq`, `ne`, `in`, `lt`, `le`, `gt` or `ge`): a value outside the range is a load error.
+
 An enum is compared by its name (`TEXT_MESSAGE_APP`) or by its number (`67`).
 
 The numbers are compared **exactly**, whatever their size: a 64-bit unsigned field with the high bit
@@ -163,6 +166,11 @@ The pattern is a .NET regular expression, with two limits:
   broker hang, and the constructs it does not support (the lookarounds, the backreferences) are a load
   error;
 - the pattern is at most 512 characters long, and it is given up if it does not finish in time.
+
+The same pattern is **compiled once** and shared by every condition that uses it, so a rule that
+repeats a pattern (and an alias that repeats a rule) costs nothing extra. A file may not hold more
+than 1000 **distinct** patterns, and compiling them may not allocate more than 128 MiB: see
+[The bounds](#the-bounds) and [The memory of the regular expressions](#the-memory-of-the-regular-expressions).
 
 ## The paths of the fields
 
@@ -327,6 +335,9 @@ the old rules or the new ones, never a mix.
   The filters were not reloaded, the rules that are in force stay in force: /etc/meshtastic-mqtt/filters.yaml:12: users.meshdev[0] (rule 'no-text'): 'channels' has both 'allow' and 'deny' (a constraint is one or the other)
   ```
 
+  A file with more than 20 problems lists the first 20 of them and counts the rest in one line
+  (`... and 9979 more errors`), so a broken file does not write a megabyte of log.
+
   The Warning is written once: it is not repeated until the file changes again.
 
 - At startup, a file that is missing or is not valid is a start error: the broker does not start, like
@@ -341,6 +352,8 @@ The file may not grow without bound:
 | the rules of the file | 10000 |
 | the conditions of the file | 100000 |
 | the values the file compiles | 1000000 |
+| the distinct patterns of the regular expressions | 1000 |
+| the memory the regex patterns allocate when compiled | 128 MiB (134217728 bytes) |
 | the size of the file | 1 MiB (1048576 bytes) |
 | the items of a list | 1000 |
 | the characters of a text value | 512 |
@@ -353,19 +366,49 @@ values of the operator `in`, summed over every rule of the file.
 The bounds are counted **after the aliases of the YAML are expanded**, so an alias that multiplies the
 rules, the conditions or the values of the file does not escape them: a small file that holds a
 million values through its aliases is a load error too. The file is checked while it is compiled and
-the load stops at the first bound it goes over, so a file that is over a budget never reaches the
-memory it would need.
+the load stops at the first bound it goes over, so a file that is over a bound is not loaded at all.
+The memory of the patterns is measured while they are compiled, and the load stops at the pattern
+that crosses it.
 
 A file that is bigger is a load error, and the message names the bound, its limit and the count the
 file reached:
 
 ```
 filters.yaml: the file holds more than 1000000 compiled values (the budget of compiled values is 1000000, the file has 1000001)
+filters.yaml: the file holds more than 1000 regex patterns (the budget of regex patterns is 1000, the file has 1001)
+filters.yaml:401: users.meshdev[0] (rule 'r0'): the regex patterns of the file allocate more than 134217728 bytes when compiled (the budget of regex memory is 134217728 bytes, the file reached 135402920 bytes at the pattern '(?i)buy (cheap|free) [a-z]+ now 99')
 ```
 
 The evaluation itself is cheap: when no rule applies to a packet, nothing is read and nothing is
 allocated. The payload of a packet is decoded **at most once**, and only when a rule that applies needs
 it.
+
+### The memory of the regular expressions
+
+The cost of a compiled pattern depends on its **shape**, so it is measured and not counted. What was
+measured on the review VM (.NET 10, arm64, a Debug test host; the numbers are approximate):
+
+| The shape of the pattern | The heap it keeps | The bytes it allocates when compiled |
+|---|---|---|
+| a literal (`spam0`) | 0.12-0.19 MB | 0.19-0.27 MB |
+| a repetition or a class (`buy[ ]+now-0`) | 0.33-0.36 MB | 0.55 MB |
+| a case-insensitive alternation (`(?i)buy (cheap\|free) [a-z]+ now 0`) | 0.78 MB | 1.32 MB |
+
+So the cost of a pattern is between 0.1 MB and 0.8 MB, and the bytes it allocates when it is
+compiled are about 1.4 to 2 times what it keeps in memory. The file is refused when compiling its
+distinct patterns allocates more than **128 MiB (134217728 bytes)**, or when it holds more than
+**1000 distinct patterns**. The memory budget is the one that is reached first in practice: a few
+hundred cheap literals, or about a hundred patterns of the costliest shape.
+
+The identical patterns are compiled **once**: a rule that repeats a pattern (and an alias that
+repeats a rule) costs nothing extra, and the memory of the file is the memory of its distinct
+patterns.
+
+A `contains` condition holds about 0.2 KB, so **use `contains` where a regular expression is not
+needed**: it is the same rule without the memory.
+
+These bounds are the only promise about the memory: the lazy cache that the engine grows while it
+matches a text is not counted by them.
 
 ## Examples
 
