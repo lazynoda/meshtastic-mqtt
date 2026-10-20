@@ -29,12 +29,6 @@ public sealed class ConnectionGuard
     /// <summary>Drop reason of an eviction: the table of per-address connect rates is full.</summary>
     public const string RateTableEvictionReason = "evicted: per-IP rate table full";
 
-    /// <summary>How many addresses the tables may track at once.</summary>
-    internal const int MaxTrackedIps = 100_000;
-
-    /// <summary>How long an address survives in the tables without a connection.</summary>
-    internal static readonly TimeSpan IdleExpiry = TimeSpan.FromMinutes(10);
-
     readonly int _maxPerIp;
     readonly TokenBucketTable? _connectRate;
     readonly BoundedMap<string, int> _connections;
@@ -44,11 +38,14 @@ public sealed class ConnectionGuard
         Action? onRateEvicted = null)
     {
         _maxPerIp = limits.MaxConnectionsPerIp ?? LimitsConfig.DefaultMaxConnectionsPerIp;
-        _connections = new BoundedMap<string, int>(MaxTrackedIps, onConnectionEvicted);
+        // The caps of the tables are configuration, not constants (see limits.max_tracked_entries).
+        var maxTracked = limits.MaxTrackedEntries ?? LimitsConfig.DefaultMaxTrackedEntries;
+        var idleExpiry = TimeSpan.FromSeconds(limits.RateIdleExpirySeconds ?? LimitsConfig.DefaultRateIdleExpirySeconds);
+        _connections = new BoundedMap<string, int>(maxTracked, onConnectionEvicted);
         var rate = limits.ConnectRatePerIpPerMinute ?? LimitsConfig.DefaultConnectRatePerIpPerMinute;
         var burst = limits.ConnectBurstPerIp ?? LimitsConfig.DefaultConnectBurstPerIp;
         if (rate > 0 && burst > 0)
-            _connectRate = new TokenBucketTable(burst, rate / 60.0, MaxTrackedIps, IdleExpiry, time, onRateEvicted);
+            _connectRate = new TokenBucketTable(burst, rate / 60.0, maxTracked, idleExpiry, time, onRateEvicted);
     }
 
     /// <summary>The connection cap per address (0 = off).</summary>

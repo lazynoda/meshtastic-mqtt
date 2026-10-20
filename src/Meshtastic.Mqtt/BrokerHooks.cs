@@ -15,9 +15,11 @@ namespace Meshtastic.Mqtt;
 /// message payloads; client-supplied strings are trimmed before logging.
 ///
 /// Log levels: authentication failures and refused connections are Warning, one line per attempt with
-/// username and IP (fail2ban reads them). A refused SUBSCRIBE is one Warning per packet. Dropped publishes are
-/// Debug per packet, plus an Information summary per drop reason every 60 s (see <see cref="DropCounters"/>).
-/// The ban of an address is one Warning when it starts; the connections of a banned address are Debug.
+/// username and IP. The in-broker ban (see <see cref="AuthBanManager"/>) counts the failures itself, so
+/// the Warnings are for the operators. A refused SUBSCRIBE is one Warning per packet. Dropped publishes
+/// are Debug per packet, plus an Information summary per drop reason every 60 s (see
+/// <see cref="DropCounters"/>). The ban of an address is one Warning when it starts; the connections of
+/// a banned address are Debug.
 /// </remarks>
 public sealed class BrokerHooks
 {
@@ -110,8 +112,11 @@ public sealed class BrokerHooks
         var publishRate = limits.PublishRatePerClientPerMinute ?? LimitsConfig.DefaultPublishRatePerClientPerMinute;
         var publishBurst = limits.PublishBurstPerClient ?? LimitsConfig.DefaultPublishBurstPerClient;
         _publishRateOn = publishRate > 0 && publishBurst > 0;
-        _publishRate = new ClientRateTable(publishBurst, publishRate / 60.0, MaxTrackedClients,
-            TimeSpan.FromMinutes(10), clock, () => Drops.Increment(ClientRateTable.EvictionReason));
+        // The caps of the tables are configuration, not constants (see limits.max_tracked_entries).
+        var maxTracked = limits.MaxTrackedEntries ?? LimitsConfig.DefaultMaxTrackedEntries;
+        var idleExpiry = TimeSpan.FromSeconds(limits.RateIdleExpirySeconds ?? LimitsConfig.DefaultRateIdleExpirySeconds);
+        _publishRate = new ClientRateTable(publishBurst, publishRate / 60.0, maxTracked,
+            idleExpiry, clock, () => Drops.Increment(ClientRateTable.EvictionReason));
         _gate = new PacketGate(limits, clock,
             onDedupeEvicted: () => Drops.Increment(PacketGate.DedupeEvictionReason),
             onRateEvicted: () => Drops.Increment(PacketGate.RateEvictionReason));
@@ -122,9 +127,6 @@ public sealed class BrokerHooks
             _publishAllow[user.Username] = (user.PublishAllow ?? []).ToArray();
         }
     }
-
-    /// <summary>How many clients the per-client publish rate table may track at once.</summary>
-    internal const int MaxTrackedClients = 100_000;
 
     internal DropCounters Drops { get; }
 
@@ -155,17 +157,23 @@ public sealed class BrokerHooks
 
     public async Task ValidateConnectionAsync(ValidatingConnectionEventArgs args)
     {
-        var remoteIp = "unknown";
+        // The remote address: without an IP endpoint it is unknown, and an unknown address is never
+        // counted, never banned and never matched against a ban (there is no key to key it by).
+        var remoteIp = (args.RemoteEndPoint as IPEndPoint)?.Address.ToString();
+        var remote = remoteIp ?? "unknown";
         try
         {
-            remoteIp = (args.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? args.RemoteEndPoint?.ToString() ?? "unknown";
+            if (remoteIp is null)
+                _log.Debug("Connection from an unknown address: the bans do not apply");
 
             // A banned address is refused before any password is checked: the ban is cheaper than PBKDF2.
             // The refusal is not a new failure (the address is already banned) and it is logged at Debug
             // only: a banned address may keep trying, and a Warning per attempt would flood the log.
-            if (_bans.IsBanned(remoteIp))
+            if (remoteIp is not null && _bans.IsBanned(remoteIp))
             {
                 args.ReasonCode = MqttConnectReasonCode.Banned;
+                // The refusal is counted like the one at the accept: same reason, same summary.
+                Drops.Increment(AuthBanManager.BannedIpReason);
                 _log.Debug("Connection refused: {RemoteIp} is banned", remoteIp);
                 return;
             }
@@ -178,8 +186,9 @@ public sealed class BrokerHooks
             {
                 args.ReasonCode = MqttConnectReasonCode.BadAuthenticationMethod;
                 _log.Warning("Connection refused: unsupported authentication method {AuthMethod} for user {Username} from {RemoteIp}",
-                    Trim(args.AuthenticationMethod), Trim(args.UserName), remoteIp);
-                _bans.RecordFailure(remoteIp, MqttConnectReasonCode.BadAuthenticationMethod);
+                    Trim(args.AuthenticationMethod), Trim(args.UserName), remote);
+                if (remoteIp is not null)
+                    _bans.RecordFailure(remoteIp, MqttConnectReasonCode.BadAuthenticationMethod);
                 return;
             }
 
@@ -191,16 +200,17 @@ public sealed class BrokerHooks
                 // Not an authentication failure (the password was not checked), so worded differently for fail2ban.
                 args.ReasonCode = MqttConnectReasonCode.ServerBusy;
                 _log.Warning("Connection refused: password check queue full, retry later (user {Username} from {RemoteIp}, client {ClientId})",
-                    Trim(args.UserName), remoteIp, Trim(args.ClientId));
+                    Trim(args.UserName), remote, Trim(args.ClientId));
                 return;
             }
             if (auth != AuthResult.Success)
             {
                 args.ReasonCode = MqttConnectReasonCode.BadUserNameOrPassword;
                 _log.Warning("Authentication failed for user {Username} from {RemoteIp} (client {ClientId})",
-                    Trim(args.UserName), remoteIp, Trim(args.ClientId));
+                    Trim(args.UserName), remote, Trim(args.ClientId));
                 // A wrong password (or an unknown user) is the failure the ban is built on.
-                _bans.RecordFailure(remoteIp, MqttConnectReasonCode.BadUserNameOrPassword);
+                if (remoteIp is not null)
+                    _bans.RecordFailure(remoteIp, MqttConnectReasonCode.BadUserNameOrPassword);
                 return;
             }
 
@@ -213,7 +223,7 @@ public sealed class BrokerHooks
                 {
                     args.ReasonCode = MqttConnectReasonCode.ClientIdentifierNotValid;
                     _log.Warning("Connection refused: client id {ClientId} belongs to a session of another user (user {Username} from {RemoteIp})",
-                        Trim(clientId), Trim(args.UserName), remoteIp);
+                        Trim(clientId), Trim(args.UserName), remote);
                     return;
                 }
                 // Only used when MQTTnet creates a new session; a reused session keeps its own (same) owner.
@@ -223,13 +233,13 @@ public sealed class BrokerHooks
 
             args.ReasonCode = MqttConnectReasonCode.Success;
             _log.Information("Client {ClientId} connected as {Username} from {RemoteIp}",
-                Trim(args.AssignedClientIdentifier ?? args.ClientId), args.UserName, remoteIp);
+                Trim(args.AssignedClientIdentifier ?? args.ClientId), args.UserName, remote);
         }
         catch (Exception ex)
         {
             args.ReasonCode = MqttConnectReasonCode.UnspecifiedError;
             _log.Error("Connection check failed for user {Username} from {RemoteIp} (client {ClientId}): {Error}",
-                Trim(args.UserName), remoteIp, Trim(args.ClientId), ex.GetType().Name);
+                Trim(args.UserName), remote, Trim(args.ClientId), ex.GetType().Name);
         }
     }
 
@@ -581,10 +591,11 @@ public sealed class BrokerHooks
             }
 
             // The cross-gateway dedupe and the per-node packet rate. A map report carries no id, so it is not
-            // deduplicated, but it is charged as one packet of its node.
+            // deduplicated, but it is charged as one packet of its node. The gateways are kept as their
+            // node numbers: the packet filter already checked the format of the gateway id.
             var verdict = result.PacketId == 0
                 ? _gate.EvaluateMapReport(result.From)
-                : _gate.EvaluatePacket(result.From, result.PacketId, result.Gateway ?? string.Empty);
+                : _gate.EvaluatePacket(result.From, result.PacketId, result.GatewayNode);
             if (verdict != PacketGate.Verdict.Accept)
             {
                 DropPublish(args, verdict == PacketGate.Verdict.RateExceeded ? MqttPubAckReasonCode.QuotaExceeded : null,

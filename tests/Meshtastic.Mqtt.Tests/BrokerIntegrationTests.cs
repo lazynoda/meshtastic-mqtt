@@ -208,7 +208,7 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
         Assert.All(perPacket, e => Assert.Equal(LogEventLevel.Debug, e.Level));
 
         _flushDrops();
-        var summary = Assert.Single(_logs.Events, e => e.Level == LogEventLevel.Information && e.MessageTemplate.Text.StartsWith("Dropped {Total}"));
+        var summary = Assert.Single(_logs.Events, e => e.Level == LogEventLevel.Information && e.MessageTemplate.Text.StartsWith("Refused or evicted {Total}"));
         Assert.Equal("3", summary.Properties["Total"].ToString());
         var rendered = summary.RenderMessage();
         Assert.Contains("malformed protobuf", rendered);
@@ -216,7 +216,7 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
 
         // Nothing dropped since: the next summary is silent.
         _flushDrops();
-        Assert.Single(_logs.Events, e => e.MessageTemplate.Text.StartsWith("Dropped {Total}"));
+        Assert.Single(_logs.Events, e => e.MessageTemplate.Text.StartsWith("Refused or evicted {Total}"));
     }
 
     [Fact]

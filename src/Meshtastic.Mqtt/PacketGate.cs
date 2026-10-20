@@ -9,7 +9,9 @@ namespace Meshtastic.Mqtt;
 /// same packet sent by different gateways is one packet of the mesh. One copy per gateway is kept (the
 /// dashboards use each gateway's copy to show who heard a packet and at what SNR), so a copy from a
 /// gateway that already sent this packet is dropped, and a copy from a new gateway is dropped once
-/// <c>dedupe_max_gateways_per_packet</c> gateways have sent it.
+/// <c>dedupe_max_gateways_per_packet</c> gateways have sent it. The gateways of a packet are kept as their
+/// node numbers, not as strings: the gateway binding already guarantees the format (<c>!</c> and 8
+/// lowercase hex digits), so the id is parsed once and the table holds 4 bytes per gateway.
 /// </para>
 /// <para>
 /// The per-node rate (<c>packet_rate_per_from_per_minute</c>) is charged once per packet, on its first
@@ -42,16 +44,10 @@ public sealed class PacketGate
 
     sealed class Entry
     {
-        public readonly HashSet<string> Gateways = new(StringComparer.Ordinal);
+        public readonly HashSet<uint> Gateways = new();
         public long FirstSeen;
         public bool RateRefused;
     }
-
-    /// <summary>How many node numbers the rate table may track at once.</summary>
-    internal const int MaxTrackedNodes = 100_000;
-
-    /// <summary>How long a node survives in the rate table without sending a packet.</summary>
-    internal static readonly TimeSpan IdleExpiry = TimeSpan.FromMinutes(10);
 
     /// <summary>Drop reason of an eviction: the dedupe table is full.</summary>
     public const string DedupeEvictionReason = "evicted: dedupe table full";
@@ -68,8 +64,8 @@ public sealed class PacketGate
     readonly object _lock = new();
     long _lastSweepTicks;
 
-    public PacketGate(LimitsConfig limits, TimeProvider time, int maxTrackedNodes = MaxTrackedNodes,
-        Action? onDedupeEvicted = null, Action? onRateEvicted = null)
+    public PacketGate(LimitsConfig limits, TimeProvider time, Action? onDedupeEvicted = null,
+        Action? onRateEvicted = null)
     {
         _time = time;
         var window = limits.DedupeWindowSeconds ?? LimitsConfig.DefaultDedupeWindowSeconds;
@@ -83,7 +79,12 @@ public sealed class PacketGate
         var rate = limits.PacketRatePerFromPerMinute ?? LimitsConfig.DefaultPacketRatePerFromPerMinute;
         var burst = limits.PacketBurstPerFrom ?? LimitsConfig.DefaultPacketBurstPerFrom;
         if (rate > 0 && burst > 0)
-            _rate = new TokenBucketTable(burst, rate / 60.0, maxTrackedNodes, IdleExpiry, time, onRateEvicted);
+        {
+            // The caps of the tables are configuration, not constants (see limits.max_tracked_entries).
+            var maxTracked = limits.MaxTrackedEntries ?? LimitsConfig.DefaultMaxTrackedEntries;
+            var idleExpiry = TimeSpan.FromSeconds(limits.RateIdleExpirySeconds ?? LimitsConfig.DefaultRateIdleExpirySeconds);
+            _rate = new TokenBucketTable(burst, rate / 60.0, maxTracked, idleExpiry, time, onRateEvicted);
+        }
     }
 
     /// <summary>Whether the cross-gateway dedupe is on.</summary>
@@ -111,13 +112,26 @@ public sealed class PacketGate
     /// <summary>Nodes evicted from the rate table to stay under the cap (for tests).</summary>
     public long RateEvictions => _rate?.Evictions ?? 0;
 
+    /// <summary>The entries the dedupe sweeps have visited so far (for tests).</summary>
+    internal long SweepVisits => _entries.Visits;
+
+    /// <summary>
+    /// The gateways that sent this packet, as node numbers (for tests). The set holds the parsed
+    /// numbers, not the strings of the gateway ids.
+    /// </summary>
+    internal uint[] GatewaysOf(uint from, uint id)
+    {
+        lock (_lock)
+            return _entries.TryGet((from, id), out var entry) ? [.. entry.Gateways.OrderBy(g => g)] : [];
+    }
+
     /// <summary>
     /// Decides about one copy of a channel packet: the dedupe first, then the node's packet budget.
     /// </summary>
     /// <param name="from">The node that sent the packet.</param>
     /// <param name="id">The packet id.</param>
-    /// <param name="gateway">The gateway that sent this copy (the envelope's gateway id).</param>
-    public Verdict EvaluatePacket(uint from, uint id, string gateway)
+    /// <param name="gateway">The gateway that sent this copy, as its node number.</param>
+    public Verdict EvaluatePacket(uint from, uint id, uint gateway)
     {
         if (!_dedupeOn)
         {
@@ -167,18 +181,18 @@ public sealed class PacketGate
 
     bool IsExpired(Entry entry, long now) => now - entry.FirstSeen >= (long)_window.TotalSeconds * _time.TimestampFrequency;
 
-    /// <summary>Removes the entries that are past the window, so a quiet broker forgets them.</summary>
+    /// <summary>
+    /// Removes the entries that are past the window, so a quiet broker forgets them. The entries expire
+    /// from the oldest end of the order and the sweep stops at the first entry that has not expired: a
+    /// sweep costs what it expires, not what the table holds.
+    /// </summary>
     void Sweep(long now)
     {
         var expiry = (long)_window.TotalSeconds * _time.TimestampFrequency;
         if (expiry <= 0 || now - _lastSweepTicks < expiry / 4)
             return;
         _lastSweepTicks = now;
-        foreach (var key in _entries.Keys())
-        {
-            if (_entries.TryGet(key, out var entry) && IsExpired(entry, now))
-                _entries.Remove(key);
-        }
+        _entries.RemoveOldestWhile((_, entry) => IsExpired(entry, now));
     }
 
     /// <summary>The key of a node in the rate table.</summary>

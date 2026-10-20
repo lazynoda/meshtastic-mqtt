@@ -225,6 +225,27 @@ public sealed class LimitsConfig
     public const int DefaultAuthBanSeconds = 3600;
 
     /// <summary>
+    /// How many entries the bounded tables may hold at once: the per-IP, the per-client and the
+    /// per-node rate tables, the table of failed logins and the table of bans.
+    /// </summary>
+    public const int DefaultMaxTrackedEntries = 100_000;
+
+    /// <summary>Smallest entry cap that may be configured.</summary>
+    public const int MinMaxTrackedEntries = 1_000;
+
+    /// <summary>Largest entry cap that may be configured.</summary>
+    public const int MaxMaxTrackedEntries = 10_000_000;
+
+    /// <summary>How long an entry of a rate table survives without being used, in seconds.</summary>
+    public const int DefaultRateIdleExpirySeconds = 600;
+
+    /// <summary>Shortest idle expiry that may be configured, in seconds.</summary>
+    public const int MinRateIdleExpirySeconds = 60;
+
+    /// <summary>Longest idle expiry that may be configured, in seconds.</summary>
+    public const int MaxRateIdleExpirySeconds = 86_400;
+
+    /// <summary>
     /// Largest MQTT packet accepted, counted as the fixed header's Remaining Length. Enforced while the header is
     /// read, before MQTTnet allocates the body, so it also bounds unauthenticated CONNECTs.
     /// </summary>
@@ -330,6 +351,19 @@ public sealed class LimitsConfig
     /// </summary>
     public List<string>? AuthBanExempt { get; set; } = new();
 
+    /// <summary>
+    /// How many entries the bounded tables may hold at once: the per-IP, the per-client and the per-node
+    /// rate tables, the table of failed logins and the table of bans. The dedupe table has its own cap
+    /// (<see cref="DedupeMaxEntries"/>).
+    /// </summary>
+    public int? MaxTrackedEntries { get; set; } = DefaultMaxTrackedEntries;
+
+    /// <summary>
+    /// How long an entry of a rate table survives without being used, in seconds: the per-IP, the
+    /// per-client and the per-node rate tables.
+    /// </summary>
+    public int? RateIdleExpirySeconds { get; set; } = DefaultRateIdleExpirySeconds;
+
     internal void Validate(List<string> errors)
     {
         Check(errors, "max_packet_size", MaxPacketSize, MinMaxPacketSize, MaxMaxPacketSize);
@@ -353,6 +387,9 @@ public sealed class LimitsConfig
         Check(errors, "auth_fail_window_seconds", AuthFailWindowSeconds, 10, 86_400);
         Check(errors, "auth_ban_seconds", AuthBanSeconds, 60, 604_800);
 
+        Check(errors, "max_tracked_entries", MaxTrackedEntries, MinMaxTrackedEntries, MaxMaxTrackedEntries);
+        Check(errors, "rate_idle_expiry_seconds", RateIdleExpirySeconds, MinRateIdleExpirySeconds, MaxRateIdleExpirySeconds);
+
         // The exempt ranges: an invalid one is a typo the operator must see at startup.
         foreach (var range in AuthBanExempt ?? [])
         {
@@ -372,6 +409,42 @@ public sealed class LimitsConfig
     {
         if (value is null || value < min || value > max)
             errors.Add($"limits.{key}: {(value is null ? "empty value" : value.ToString())} is not an integer between {min} and {max}");
+    }
+
+    /// <summary>
+    /// Every limit with the value the broker will use, as the startup line shows it:
+    /// "key=value, key=value, ...". The exempt ranges are listed as they are written in the config, so
+    /// the operator sees the whole configuration in one line.
+    /// </summary>
+    public string Describe() => string.Join(", ",
+        $"max_packet_size={MaxPacketSize ?? DefaultMaxPacketSize}",
+        $"communication_timeout_seconds={CommunicationTimeoutSeconds ?? DefaultCommunicationTimeoutSeconds}",
+        $"auth_queue_timeout_seconds={AuthQueueTimeoutSeconds ?? DefaultAuthQueueTimeoutSeconds}",
+        $"auth_max_pending={AuthMaxPending ?? DefaultAuthMaxPending}",
+        $"auth_max_pending_per_user={AuthMaxPendingPerUser ?? DefaultAuthMaxPendingPerUser}",
+        $"max_connections_per_ip={MaxConnectionsPerIp ?? DefaultMaxConnectionsPerIp}",
+        $"connect_rate_per_ip_per_minute={ConnectRatePerIpPerMinute ?? DefaultConnectRatePerIpPerMinute}",
+        $"connect_burst_per_ip={ConnectBurstPerIp ?? DefaultConnectBurstPerIp}",
+        $"max_payload_size={MaxPayloadSize ?? DefaultMaxPayloadSize}",
+        $"publish_rate_per_client_per_minute={PublishRatePerClientPerMinute ?? DefaultPublishRatePerClientPerMinute}",
+        $"publish_burst_per_client={PublishBurstPerClient ?? DefaultPublishBurstPerClient}",
+        $"dedupe_window_seconds={DedupeWindowSeconds ?? DefaultDedupeWindowSeconds}",
+        $"dedupe_max_gateways_per_packet={DedupeMaxGatewaysPerPacket ?? DefaultDedupeMaxGatewaysPerPacket}",
+        $"dedupe_max_entries={DedupeMaxEntries ?? DefaultDedupeMaxEntries}",
+        $"packet_rate_per_from_per_minute={PacketRatePerFromPerMinute ?? DefaultPacketRatePerFromPerMinute}",
+        $"packet_burst_per_from={PacketBurstPerFrom ?? DefaultPacketBurstPerFrom}",
+        $"auth_fail_max_per_ip={AuthFailMaxPerIp ?? DefaultAuthFailMaxPerIp}",
+        $"auth_fail_window_seconds={AuthFailWindowSeconds ?? DefaultAuthFailWindowSeconds}",
+        $"auth_ban_seconds={AuthBanSeconds ?? DefaultAuthBanSeconds}",
+        $"auth_ban_exempt={DescribeExempt()}",
+        $"max_tracked_entries={MaxTrackedEntries ?? DefaultMaxTrackedEntries}",
+        $"rate_idle_expiry_seconds={RateIdleExpirySeconds ?? DefaultRateIdleExpirySeconds}");
+
+    /// <summary>The exempt ranges as they are written in the config (an empty list as "[]").</summary>
+    string DescribeExempt()
+    {
+        var ranges = AuthBanExempt;
+        return ranges is { Count: > 0 } ? "[" + string.Join(", ", ranges) + "]" : "[]";
     }
 }
 

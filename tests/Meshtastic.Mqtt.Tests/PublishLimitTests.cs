@@ -292,6 +292,78 @@ public sealed class PublishLimitTests
     }
 
     [Fact]
+    public async Task Dedupe_TheSameGatewayId_IsTheSameGateway()
+    {
+        // The gateway id is parsed into its node number, so the same id is the same gateway: the copy
+        // is a duplicate and not a second gateway.
+        var harness = new Harness(Config());
+        const string Gateway = "!0000abcd";
+        Assert.True((await harness.Publish($"msh/EU_868/2/e/SFNarrow/{Gateway}",
+            WithGateway("sfnarrow_aq.bin", Gateway), clientId: "gw-1")).Accepted);
+
+        var replay = await harness.Publish($"msh/EU_868/2/e/SFNarrow/{Gateway}",
+            WithGateway("sfnarrow_aq.bin", Gateway), clientId: "gw-1");
+        Assert.False(replay.Accepted);
+        Assert.False(replay.Closed);
+        Assert.Equal(1, harness.Dropped(BrokerHooks.DuplicateGatewayReason));
+        Assert.Equal(0, harness.Dropped(BrokerHooks.TooManyGatewaysReason));
+    }
+
+    [Fact]
+    public void TheDedupe_KeepsTheGatewaysAsNodeNumbers()
+    {
+        // The gateways of a packet are kept as their node numbers, not as the strings of their ids: the
+        // gateway binding already guarantees the format, so the id is parsed once.
+        var clock = new FakeClock();
+        var gate = new PacketGate(Config("limits:\n  packet_rate_per_from_per_minute: 0").Limits!, clock);
+
+        Assert.Equal(PacketGate.Verdict.Accept, gate.EvaluatePacket(1, 1, 0xabcd));
+        Assert.Equal([0xabcdu], gate.GatewaysOf(1, 1));
+
+        // The same packet from the same gateway is a duplicate: the same gateway is the same number.
+        Assert.Equal(PacketGate.Verdict.DuplicateFromSameGateway, gate.EvaluatePacket(1, 1, 0xabcd));
+        Assert.Equal([0xabcdu], gate.GatewaysOf(1, 1));
+
+        // Another gateway of the same packet is kept apart.
+        Assert.Equal(PacketGate.Verdict.Accept, gate.EvaluatePacket(1, 1, 1));
+        Assert.Equal([0x0001u, 0xabcdu], gate.GatewaysOf(1, 1));
+    }
+
+    [Fact]
+    public void TheGatewayId_IsParsedIntoItsNodeNumber()
+    {
+        // "!0000abcd" is the node 0xabcd, the way the firmware writes it.
+        Assert.True(PacketInspector.TryParseGatewayId("!0000abcd", out var node));
+        Assert.Equal(0xabcdu, node);
+        Assert.True(PacketInspector.TryParseGatewayId("!1a2b3c4d", out node));
+        Assert.Equal(0x1a2b3c4du, node);
+
+        // The format the firmware does not write is not a node id.
+        Assert.False(PacketInspector.TryParseGatewayId("!0000ABCD", out _));
+        Assert.False(PacketInspector.TryParseGatewayId("1a2b3c4d", out _));
+        Assert.False(PacketInspector.TryParseGatewayId(null, out _));
+    }
+
+    [Fact]
+    public void TheDedupeSweep_StopsAtTheFirstLiveEntry()
+    {
+        // The sweep expires from the oldest end of the order and stops at the first entry that has not
+        // expired: it costs what it expires, not what the table holds.
+        var clock = new FakeClock();
+        var gate = new PacketGate(Config("limits:\n  dedupe_window_seconds: 120\n  packet_rate_per_from_per_minute: 0").Limits!, clock);
+        for (uint i = 1; i <= 100; i++)
+            Assert.Equal(PacketGate.Verdict.Accept, gate.EvaluatePacket(i, i, 1));
+
+        // A quarter of the window passes: the next packet sweeps, and there is nothing to expire.
+        clock.Advance(TimeSpan.FromSeconds(31));
+        var before = gate.SweepVisits;
+        Assert.Equal(PacketGate.Verdict.Accept, gate.EvaluatePacket(1000, 1000, 1));
+
+        Assert.Equal(1, gate.SweepVisits - before);      // it visited the oldest entry and stopped
+        Assert.Equal(101, gate.DedupeCount);              // nothing was expired
+    }
+
+    [Fact]
     public async Task Dedupe_KeepsOneCopyPerGateway_AndCapsTheNumberOfGateways()
     {
         var harness = new Harness(Config());
@@ -444,14 +516,14 @@ public sealed class PublishLimitTests
     public void AFloodOfForgedNodeNumbers_StaysUnderTheNodeCap()
     {
         // The per-node rate table is bounded too: a client that forges the `from` of its packets cannot
-        // grow it without limit.
+        // grow it without limit. The cap is the configured one (limits.max_tracked_entries).
         var clock = new FakeClock();
-        var gate = new PacketGate(Config("limits:\n  packet_rate_per_from_per_minute: 60\n  packet_burst_per_from: 1").Limits!, clock, 50);
-        for (uint i = 1; i <= 500; i++)
-            gate.EvaluatePacket(i, i, "!00000001");
+        var gate = new PacketGate(Config("limits:\n  packet_rate_per_from_per_minute: 60\n  packet_burst_per_from: 1\n  max_tracked_entries: 1000").Limits!, clock);
+        for (uint i = 1; i <= 1200; i++)
+            gate.EvaluatePacket(i, i, 1);
 
-        Assert.True(gate.RateCount <= 50, $"{gate.RateCount} nodes left");
-        Assert.True(gate.RateEvictions >= 450, $"{gate.RateEvictions} evictions");
+        Assert.True(gate.RateCount <= 1000, $"{gate.RateCount} nodes left");
+        Assert.True(gate.RateEvictions >= 200, $"{gate.RateEvictions} evictions");
     }
 
     // ---- Concurrency ----------------------------------------------------------------------------------------

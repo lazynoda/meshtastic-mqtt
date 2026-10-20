@@ -287,7 +287,7 @@ public sealed class PublishAclTests : IAsyncLifetime
         Assert.DoesNotContain(_logs.Events, e => e.Level >= LogEventLevel.Warning);
 
         _flushDrops();
-        var summary = Assert.Single(_logs.Events, e => e.Level == LogEventLevel.Information && e.MessageTemplate.Text.StartsWith("Dropped {Total}"));
+        var summary = Assert.Single(_logs.Events, e => e.Level == LogEventLevel.Information && e.MessageTemplate.Text.StartsWith("Refused or evicted {Total}"));
         Assert.Equal("20", summary.Properties["Total"].ToString());
         Assert.Contains("not in publish_allow", summary.RenderMessage());
     }
@@ -310,7 +310,7 @@ public sealed class PublishAclTests : IAsyncLifetime
 
         Assert.Equal([$"{MapTopic} {PublishFilterTests.Fixture("map_report.bin").Length}"], received.ToArray());
         _flushDrops();
-        var summary = Assert.Single(_logs.Events, e => e.MessageTemplate.Text.StartsWith("Dropped {Total}")).RenderMessage();
+        var summary = Assert.Single(_logs.Events, e => e.MessageTemplate.Text.StartsWith("Refused or evicted {Total}")).RenderMessage();
         foreach (var reason in new[] { "map report: packet is not decoded", "map report: portnum is not MAP_REPORT_APP",
                      "map report: payload is not a MapReport", "map report: gateway_id is not the sender (from)", "not in publish_allow" })
             Assert.Contains(reason, summary);

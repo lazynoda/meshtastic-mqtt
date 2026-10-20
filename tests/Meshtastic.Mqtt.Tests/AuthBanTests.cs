@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Meshtastic.Mqtt;
@@ -254,10 +255,10 @@ public sealed class AuthBanTests
     public void TheFailureTable_IsBounded_AndCountsItsEvictions()
     {
         var (bans, _, _) = Manager("limits:\n  auth_fail_max_per_ip: 100000");
-        for (var i = 0; i < AuthBanManager.MaxTrackedIps + 10; i++)
+        for (var i = 0; i < LimitsConfig.DefaultMaxTrackedEntries + 10; i++)
             bans.RecordFailure($"10.{(i / 65536) % 256}.{(i / 256) % 256}.{i % 256}");
 
-        Assert.True(bans.TrackedFailures <= AuthBanManager.MaxTrackedIps);
+        Assert.True(bans.TrackedFailures <= LimitsConfig.DefaultMaxTrackedEntries);
         Assert.Equal(10, bans.FailureEvictions);
         Assert.Equal(0, bans.TrackedBans);
     }
@@ -319,7 +320,7 @@ public sealed class AuthBanTests
             }
         }
 
-        Assert.True(bans.ExpiryQueueCount <= AuthBanManager.MaxTrackedIps,
+        Assert.True(bans.ExpiryQueueCount <= LimitsConfig.DefaultMaxTrackedEntries,
             $"the expiry queue grew to {bans.ExpiryQueueCount} entries");
         Assert.True(bans.ExpiryQueueCount <= AuthBanManager.SweepEveryInserts + bans.TrackedBans,
             $"the expiry queue kept the entries of the bans that ended: {bans.ExpiryQueueCount}");
@@ -331,7 +332,7 @@ public sealed class AuthBanTests
         // Every ban is a second longer than the one before, so the first one ends soonest.
         var (bans, clock, _) = Manager("limits:\n  auth_fail_max_per_ip: 1\n  auth_ban_seconds: 604800");
         string first = "", second = "";
-        for (var i = 0; i < AuthBanManager.MaxTrackedIps; i++)
+        for (var i = 0; i < LimitsConfig.DefaultMaxTrackedEntries; i++)
         {
             var ip = $"10.{(i / 65536) % 256}.{(i / 256) % 256}.{i % 256}";
             if (i == 0) first = ip;
@@ -339,12 +340,12 @@ public sealed class AuthBanTests
             Assert.True(bans.RecordFailure(ip));
             clock.Advance(TimeSpan.FromSeconds(1));
         }
-        Assert.Equal(AuthBanManager.MaxTrackedIps, bans.TrackedBans);
+        Assert.Equal(LimitsConfig.DefaultMaxTrackedEntries, bans.TrackedBans);
         Assert.Equal(0, bans.BanEvictions);
 
         // The table is full: the ban that ends soonest is the one that goes.
         Assert.True(bans.RecordFailure("11.0.0.1"));
-        Assert.Equal(AuthBanManager.MaxTrackedIps, bans.TrackedBans);
+        Assert.Equal(LimitsConfig.DefaultMaxTrackedEntries, bans.TrackedBans);
         Assert.Equal(1, bans.BanEvictions);
         Assert.False(bans.IsBanned(first));
         Assert.True(bans.IsBanned(second));
@@ -355,7 +356,7 @@ public sealed class AuthBanTests
     {
         // The tables of the broker count their evictions in the same summary as the dropped publishes.
         var hooks = Hooks("limits:\n  auth_fail_max_per_ip: 100000");
-        for (var i = 0; i < AuthBanManager.MaxTrackedIps + 1; i++)
+        for (var i = 0; i < LimitsConfig.DefaultMaxTrackedEntries + 1; i++)
             hooks.Bans.RecordFailure($"10.{(i / 65536) % 256}.{(i / 256) % 256}.{i % 256}");
 
         var drops = hooks.Instance.Drops.Snapshot();
@@ -514,6 +515,97 @@ public sealed class AuthBanTests
         Assert.Equal(MqttConnectReasonCode.Success, good.ReasonCode);
     }
 
+    [Fact]
+    public async Task ABannedAddress_RefusedAtTheConnect_IsCountedInTheSummary()
+    {
+        // The refusal at the CONNECT is counted like the one at the accept: the same reason, so the
+        // operator sees every refused connection of a banned address in one place.
+        var hooks = Hooks("limits:\n  auth_fail_max_per_ip: 1");
+        await hooks.ValidateConnectionAsync(Args(new MqttConnectPacket
+            { ClientId = "c1", Username = "meshdev", Password = Pw("wrong") }));
+        Assert.True(hooks.Bans.IsBanned(RemoteIp));
+
+        var banned = Args(new MqttConnectPacket { ClientId = "c2", Username = "meshdev", Password = Pw("correct-horse") });
+        await hooks.ValidateConnectionAsync(banned);
+
+        Assert.Equal(MqttConnectReasonCode.Banned, banned.ReasonCode);
+        Assert.Equal(1, hooks.Instance.Drops.Snapshot().GetValueOrDefault(AuthBanManager.BannedIpReason));
+    }
+
+    [Fact]
+    public void IsBanned_SweepsTheExpiredFailuresAndBans()
+    {
+        // A broker without new failures must not keep the failures whose window has passed and the bans
+        // that have ended: a call to IsBanned sweeps them.
+        var (bans, clock, _) = Manager("limits:\n  auth_fail_max_per_ip: 2\n  auth_fail_window_seconds: 10\n  auth_ban_seconds: 60");
+        Assert.False(bans.RecordFailure("1.2.3.4"));      // one failure, not banned
+        Assert.False(bans.RecordFailure("5.6.7.8"));      // one failure, not banned
+        Assert.True(bans.RecordFailure("5.6.7.8"));       // the second one bans the address
+        Assert.Equal(1, bans.TrackedFailures);
+        Assert.Equal(1, bans.TrackedBans);
+
+        clock.Advance(TimeSpan.FromSeconds(61));
+        Assert.False(bans.IsBanned("1.2.3.4"));           // the sweep runs here
+
+        Assert.Equal(0, bans.TrackedFailures);
+        Assert.Equal(0, bans.TrackedBans);
+    }
+
+    [Fact]
+    public void AnUnparseableExemptRange_IsAnError_NotASilentlyDroppedRange()
+    {
+        // The config validation reports it, but the ban manager must not swallow it either: a range the
+        // operator wrote is either a range or an error.
+        var logs = new LogSink();
+        var logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(logs).CreateLogger();
+        var limits = new LimitsConfig { AuthBanExempt = ["10.0.0.0/8", "not-an-ip"] };
+
+        var ex = Assert.Throws<ConfigException>(() => new AuthBanManager(limits, new FakeClock(), logger));
+        Assert.Contains("limits.auth_ban_exempt", ex.Message);
+        Assert.Contains("not-an-ip", ex.Message);
+    }
+
+    [Fact]
+    public async Task AnUnknownAddress_IsNeverCounted_NeverBanned_AndLoggedAtDebug()
+    {
+        // Without an IP endpoint the address is unknown: there is no key to count a failure for it, so it
+        // is never counted, never banned and never matched against a ban. The refusal itself is still
+        // logged as it always was; what changes is the address, and the line that says it is unknown.
+        var hooks = Hooks("limits:\n  auth_fail_max_per_ip: 1");
+        var args = Args(new MqttConnectPacket { ClientId = "c1", Username = "meshdev", Password = Pw("wrong") },
+            new FakeAdapter { RemoteEndPoint = null! });
+
+        await hooks.ValidateConnectionAsync(args);
+
+        Assert.Equal(MqttConnectReasonCode.BadUserNameOrPassword, args.ReasonCode);
+        Assert.Equal(0, hooks.Bans.TrackedFailures);
+        Assert.Equal(0, hooks.Bans.TrackedBans);
+        Assert.False(hooks.Bans.IsBanned("unknown"));
+        Assert.Contains(hooks.Logs.Events, e => e.Level == LogEventLevel.Debug
+            && e.RenderMessage().Contains("unknown address"));
+    }
+
+    [Fact]
+    public void TheListener_NeverMatchesABanWithAnUnknownAddress()
+    {
+        // The bans are keyed by address, so an address the broker does not know never matches one.
+        var clock = new FakeClock();
+        var logs = new LogSink();
+        var logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(logs).CreateLogger();
+        var bans = new AuthBanManager(new LimitsConfig { AuthFailMaxPerIp = 1 }, clock, logger);
+        Assert.True(bans.RecordFailure("1.2.3.4"));
+        var adapter = new PacketSizeLimitedTcpAdapter(IPAddress.Loopback, 4096, logger, bans: bans);
+
+        // An IP endpoint is the key of the bans.
+        Assert.Equal("1.2.3.4", PacketSizeLimitedTcpAdapter.RemoteIp(new IPEndPoint(IPAddress.Parse("1.2.3.4"), 40000)));
+        Assert.True(adapter.IsBannedAddress("1.2.3.4"));
+
+        // An endpoint that is not an IP one has no address: it never matches a ban.
+        Assert.Null(PacketSizeLimitedTcpAdapter.RemoteIp(null));
+        Assert.Null(PacketSizeLimitedTcpAdapter.RemoteIp(new NotAnIpEndPoint()));
+        Assert.False(adapter.IsBannedAddress(null));
+    }
+
     // ---- The helpers ---------------------------------------------------------------------------------------
 
     const string RemoteIp = "203.0.113.7";
@@ -543,8 +635,8 @@ public sealed class AuthBanTests
         return new HookHarness(instance, logs);
     }
 
-    static ValidatingConnectionEventArgs Args(MqttConnectPacket packet) =>
-        new(packet, new FakeAdapter(), new Hashtable(), CancellationToken.None);
+    static ValidatingConnectionEventArgs Args(MqttConnectPacket packet, IMqttChannelAdapter? adapter = null) =>
+        new(packet, adapter ?? new FakeAdapter(), new Hashtable(), CancellationToken.None);
 
     /// <summary>A channel adapter that only says where the connection comes from.</summary>
     sealed class FakeAdapter : IMqttChannelAdapter
@@ -554,7 +646,7 @@ public sealed class AuthBanTests
         public long BytesReceived => 0;
         public long BytesSent => 0;
         public X509Certificate2 ClientCertificate => null!;
-        public EndPoint RemoteEndPoint { get; } = new IPEndPoint(IPAddress.Parse(RemoteIp), 40000);
+        public EndPoint RemoteEndPoint { get; set; } = new IPEndPoint(IPAddress.Parse(RemoteIp), 40000);
         public EndPoint LocalEndPoint { get; } = new IPEndPoint(IPAddress.Loopback, 1883);
         public bool IsSecureConnection => false;
         public MqttPacketFormatterAdapter PacketFormatterAdapter => _formatter;
@@ -564,5 +656,13 @@ public sealed class AuthBanTests
         public void ResetStatistics() { }
         public Task SendPacketAsync(MqttPacket packet, CancellationToken cancellationToken) => Task.CompletedTask;
         public void Dispose() { }
+    }
+
+    /// <summary>An endpoint that is not an IP one: the listener never sees one over TCP.</summary>
+    sealed class NotAnIpEndPoint : EndPoint
+    {
+        public override AddressFamily AddressFamily => AddressFamily.Unix;
+        public override SocketAddress Serialize() => new(AddressFamily.Unix);
+        public override string ToString() => "not-an-ip";
     }
 }

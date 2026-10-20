@@ -65,6 +65,12 @@ public sealed class AuthBanNetworkTests : IAsyncLifetime
           auth_ban_seconds: 3600
         """;
 
+    /// <summary>
+    /// How long the broker may take to close a connection it refuses at the accept: it refuses it
+    /// before it reads a single byte, so the close must arrive at once (a second, not five).
+    /// </summary>
+    const double RefusedCloseTimeoutSeconds = 1;
+
     public ValueTask InitializeAsync() => ValueTask.CompletedTask;
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
@@ -134,6 +140,7 @@ public sealed class AuthBanNetworkTests : IAsyncLifetime
     /// <summary>
     /// Opens a connection the broker is expected to refuse at the accept. The connect itself may fail (the
     /// broker closes the socket before the handshake is over) or the socket may be closed right after.
+    /// The close must arrive at once: the broker refuses the connection before it reads a single byte.
     /// </summary>
     async Task<bool> RefusedAtAccept(Socket socket)
     {
@@ -145,7 +152,7 @@ public sealed class AuthBanNetworkTests : IAsyncLifetime
         {
             return true;   // the broker refused it before the handshake was complete
         }
-        return await ClosedByServer(socket, 5);
+        return await ClosedByServer(socket, RefusedCloseTimeoutSeconds);
     }
 
     /// <summary>

@@ -145,20 +145,27 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
             }
 
             // The per-IP limits, before a single MQTT byte is read. A refused connection is closed at once.
-            var remoteIp = (client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "unknown";
+            // The address is unknown when the endpoint is not an IP one: an unknown address is never
+            // matched against a ban and is never counted (there is no key to key it by).
+            var address = RemoteIp(client.RemoteEndPoint);
+            if (address is null)
+                log.Debug("Connection from {RemoteEndPoint}: the address is unknown, the bans do not apply", client.RemoteEndPoint);
 
             // A banned address is closed at once, before it takes a slot or a token of the per-IP limits:
             // the ban is cheaper than the limits, and a banned address has nothing to say.
-            if (Bans is not null && Bans.IsBanned(remoteIp))
+            if (IsBannedAddress(address))
             {
                 drops?.Increment(AuthBanManager.BannedIpReason);
                 // Debug per connection: a banned address may keep trying, and a Warning per attempt
                 // would flood the log. The refusals are counted in the same summary as the dropped publishes.
-                log.Debug("Connection refused from {RemoteIp}: {Reason}", remoteIp, AuthBanManager.BannedIpReason);
+                log.Debug("Connection refused from {RemoteIp}: {Reason}", address, AuthBanManager.BannedIpReason);
                 CloseRefused(client);
                 continue;
             }
 
+            // The per-IP limits are keyed by the address, as always: an unknown one shares the
+            // "unknown" key, so it is still bound by the connection cap and the connect rate.
+            var remoteIp = address ?? "unknown";
             if (!Guard.TryAcquire(remoteIp, out var refusal))
             {
                 drops?.Increment(refusal!);
@@ -182,6 +189,18 @@ public sealed class PacketSizeLimitedTcpAdapter(IPAddress bindAddress, int maxPa
             }
         }
     }
+
+    /// <summary>
+    /// The address of a remote endpoint, or null when it is not an IP one. An unknown address is never
+    /// matched against a ban and no failure is ever counted for it: there is no key to key it by.
+    /// </summary>
+    internal static string? RemoteIp(EndPoint? endpoint) => (endpoint as IPEndPoint)?.Address.ToString();
+
+    /// <summary>
+    /// Whether the address must be refused because it is banned. An unknown address (null) never
+    /// matches a ban: the bans are keyed by address.
+    /// </summary>
+    internal bool IsBannedAddress(string? ip) => ip is not null && Bans is not null && Bans.IsBanned(ip);
 
     /// <summary>Closes a connection the broker refuses at the accept, without a byte of MQTT read.</summary>
     void CloseRefused(Socket client)

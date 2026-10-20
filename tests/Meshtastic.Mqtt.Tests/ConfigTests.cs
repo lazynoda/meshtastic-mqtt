@@ -117,6 +117,8 @@ public class ConfigTests
         Assert.Equal(200_000, c.Limits.DedupeMaxEntries);
         Assert.Equal(30, c.Limits.PacketRatePerFromPerMinute);
         Assert.Equal(15, c.Limits.PacketBurstPerFrom);
+        Assert.Equal(100_000, c.Limits.MaxTrackedEntries);
+        Assert.Equal(600, c.Limits.RateIdleExpirySeconds);
     }
 
     [Fact]
@@ -216,6 +218,8 @@ public class ConfigTests
         Assert.Equal(200_000, d.DedupeMaxEntries);
         Assert.Equal(30, d.PacketRatePerFromPerMinute);
         Assert.Equal(15, d.PacketBurstPerFrom);
+        Assert.Equal(100_000, d.MaxTrackedEntries);
+        Assert.Equal(600, d.RateIdleExpirySeconds);
 
         var c = ConfigLoader.Parse(Minimal("limits:\n  max_packet_size: 2048\n  communication_timeout_seconds: 5\n  auth_queue_timeout_seconds: 2\n  auth_max_pending: 8\n  auth_max_pending_per_user: 2")).Limits!;
         Assert.Equal(2048, c.MaxPacketSize);
@@ -334,6 +338,61 @@ public class ConfigTests
             Minimal("limits:\n  max_packet_size: 1024\n  max_payload_size: 2048")));
         Assert.Contains("limits.max_payload_size", ex.Message);
         Assert.Contains("1024", ex.Message);
+    }
+
+    [Fact]
+    public void TheTableCaps_HaveTheirDefaults_AndCanBeSet()
+    {
+        // The caps of the bounded tables and the idle expiry of the rate tables are configuration.
+        var d = ConfigLoader.Parse(Minimal()).Limits!;
+        Assert.Equal(100_000, d.MaxTrackedEntries);
+        Assert.Equal(600, d.RateIdleExpirySeconds);
+
+        var c = ConfigLoader.Parse(Minimal("limits:\n  max_tracked_entries: 5000\n  rate_idle_expiry_seconds: 120")).Limits!;
+        Assert.Equal(5000, c.MaxTrackedEntries);
+        Assert.Equal(120, c.RateIdleExpirySeconds);
+    }
+
+    [Theory]
+    [InlineData("limits:\n  max_tracked_entries: 999", "limits.max_tracked_entries")]
+    [InlineData("limits:\n  max_tracked_entries: 10000001", "limits.max_tracked_entries")]
+    [InlineData("limits:\n  max_tracked_entries:", "limits.max_tracked_entries")]
+    [InlineData("limits:\n  rate_idle_expiry_seconds: 59", "limits.rate_idle_expiry_seconds")]
+    [InlineData("limits:\n  rate_idle_expiry_seconds: 86401", "limits.rate_idle_expiry_seconds")]
+    [InlineData("limits:\n  rate_idle_expiry_seconds:", "limits.rate_idle_expiry_seconds")]
+    public void InvalidTableCaps_AreRejected(string extra, string mentions)
+    {
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));
+        Assert.Contains(mentions, ex.Message);
+    }
+
+    [Fact]
+    public void TheStartupLine_ShowsEveryLimit()
+    {
+        // The startup line tells the operator what the broker is running with: every limit of the
+        // section, and the exempt ranges as they are written (not their number).
+        var config = ConfigLoader.Parse(Minimal("limits:\n  auth_ban_exempt: ['10.0.0.0/8', '2001:db8::/32']"));
+        var summary = config.Limits!.Describe();
+
+        foreach (var key in new[]
+        {
+            "max_packet_size", "communication_timeout_seconds", "auth_queue_timeout_seconds",
+            "auth_max_pending", "auth_max_pending_per_user", "max_connections_per_ip",
+            "connect_rate_per_ip_per_minute", "connect_burst_per_ip", "max_payload_size",
+            "publish_rate_per_client_per_minute", "publish_burst_per_client", "dedupe_window_seconds",
+            "dedupe_max_gateways_per_packet", "dedupe_max_entries", "packet_rate_per_from_per_minute",
+            "packet_burst_per_from", "auth_fail_max_per_ip", "auth_fail_window_seconds",
+            "auth_ban_seconds", "auth_ban_exempt", "max_tracked_entries", "rate_idle_expiry_seconds",
+        })
+        {
+            Assert.Contains($"{key}=", summary);
+        }
+
+        // The values are there too, and the exempt ranges are listed.
+        Assert.Contains("max_packet_size=4096", summary);
+        Assert.Contains("max_tracked_entries=100000", summary);
+        Assert.Contains("rate_idle_expiry_seconds=600", summary);
+        Assert.Contains("auth_ban_exempt=[10.0.0.0/8, 2001:db8::/32]", summary);
     }
 
     [Theory]

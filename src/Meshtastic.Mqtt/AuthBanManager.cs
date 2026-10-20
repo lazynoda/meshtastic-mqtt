@@ -22,7 +22,7 @@ namespace Meshtastic.Mqtt;
 /// (CGNAT, VPN) would keep the guesses alive.
 /// </para>
 /// <para>
-/// Both tables are bounded (<see cref="MaxTrackedIps"/>): the failures are evicted oldest first, the
+/// Both tables are bounded (<c>limits.max_tracked_entries</c>): the failures are evicted oldest first, the
 /// bans evict the one that ends soonest. They also expire by themselves: an amortized sweep forgets the
 /// failures whose window has passed and the bans that have ended, so a flood of failures from many
 /// rotating addresses leaves nothing behind. The state is in memory only: a restart forgets every ban.
@@ -38,9 +38,6 @@ public sealed class AuthBanManager
 
     /// <summary>Drop reason of an eviction: the table of bans is full.</summary>
     public const string BanTableEvictionReason = "evicted: auth ban table full";
-
-    /// <summary>How many addresses the tables may track at once.</summary>
-    internal const int MaxTrackedIps = 100_000;
 
     /// <summary>
     /// How many counted failures happen between two sweeps when the clock does not move. The sweep also
@@ -75,13 +72,14 @@ public sealed class AuthBanManager
     /// <summary>
     /// The bans by the moment they end, so the one that ends soonest can be evicted first.
     /// <para>
-    /// Its size is bounded: it never holds more than <see cref="MaxTrackedIps"/> entries (the cap of the
+    /// Its size is bounded: it never holds more entries than the ban table has bans (the cap of the
     /// ban table). It is rebuilt from the live bans when it grows past that, and the entries of the bans
     /// that have ended are dropped when they reach its head.
     /// </para>
     /// </summary>
     readonly PriorityQueue<string, long> _bansByExpiry = new();
     readonly object _lock = new();
+    readonly int _maxTracked;
     long _banEvictions;
     long _lastSweepTicks;
     int _insertsSinceSweep;
@@ -103,14 +101,28 @@ public sealed class AuthBanManager
         // The tables are swept at least every quarter of the shortest life of an entry (the failure
         // window or the ban), and at least every SweepEveryInserts counted failures.
         _sweepIntervalTicks = Math.Max(1, Math.Min(_windowTicks, _banTicks) / 4);
-        _exempt = (limits.AuthBanExempt ?? [])
-            .Select(text => IpCidr.TryParse(text, out var cidr, out _) ? cidr : null)
-            .Where(cidr => cidr is not null)
-            .Select(cidr => cidr!)
-            .ToArray();
-        _failures = new BoundedMap<string, Failure>(MaxTrackedIps, onFailureEvicted);
+        _exempt = ParseExempt(limits.AuthBanExempt ?? []);
+        // The caps of the tables are configuration, not constants (see limits.max_tracked_entries).
+        _maxTracked = limits.MaxTrackedEntries ?? LimitsConfig.DefaultMaxTrackedEntries;
+        _failures = new BoundedMap<string, Failure>(_maxTracked, onFailureEvicted);
         _onBanEvicted = onBanEvicted;
         _lastSweepTicks = time.GetTimestamp();
+    }
+
+    /// <summary>
+    /// The exempt ranges. A range that cannot be parsed is a typo the operator must see: it is an
+    /// error, not a range that is silently dropped (the config validation reports it too).
+    /// </summary>
+    static IpCidr[] ParseExempt(List<string> ranges)
+    {
+        var exempt = new IpCidr[ranges.Count];
+        for (var i = 0; i < ranges.Count; i++)
+        {
+            if (!IpCidr.TryParse(ranges[i], out var cidr, out var error))
+                throw new ConfigException($"limits.auth_ban_exempt: {error}");
+            exempt[i] = cidr!;
+        }
+        return exempt;
     }
 
     /// <summary>Whether the bans are on (the failure limit is not 0).</summary>
@@ -129,7 +141,13 @@ public sealed class AuthBanManager
     public bool IsBanned(string ip)
     {
         lock (_lock)
-            return IsBannedLocked(ip, _time.GetTimestamp());
+        {
+            var now = _time.GetTimestamp();
+            // The tables are swept first: a broker without new failures must not keep the failures
+            // whose window has passed and the bans that have ended.
+            SweepIfDueLocked(now);
+            return IsBannedLocked(ip, now);
+        }
     }
 
     /// <summary>
@@ -141,6 +159,8 @@ public sealed class AuthBanManager
         if (_maxFailures <= 0)
             return false;   // the bans are off
 
+        bool banned;
+        int failures;
         lock (_lock)
         {
             var now = _time.GetTimestamp();
@@ -173,10 +193,15 @@ public sealed class AuthBanManager
             // The limit is reached: the address is banned and its counter is cleared.
             _failures.Remove(ip);
             StartBanLocked(ip, now);
-            _log.Warning("Banned {RemoteIp} for {Seconds} s after {Failures} authentication failures",
-                ip, _banSeconds, failure.Count);
-            return true;
+            banned = true;
+            failures = failure.Count;
         }
+
+        // The Warning is written outside the lock: the log must not be held up by the lock of the
+        // tables, and a log call that blocks must not block the other logins.
+        _log.Warning("Banned {RemoteIp} for {Seconds} s after {Failures} authentication failures",
+            ip, _banSeconds, failures);
+        return true;
     }
 
     /// <summary>
@@ -238,7 +263,7 @@ public sealed class AuthBanManager
 
     /// <summary>
     /// The entries of the queue that orders the bans by the moment they end (for tests). It never holds
-    /// more than <see cref="MaxTrackedIps"/> entries.
+    /// more entries than the ban table has bans.
     /// </summary>
     public int ExpiryQueueCount
     {
@@ -309,10 +334,10 @@ public sealed class AuthBanManager
     void StartBanLocked(string ip, long now)
     {
         var expiresAt = now + _banTicks;
-        if (_bans.Count >= MaxTrackedIps)
+        if (_bans.Count >= _maxTracked)
         {
             // The table is full: the ban that ends soonest is evicted (an expired one is simply dropped).
-            while (_bans.Count >= MaxTrackedIps && _bansByExpiry.TryDequeue(out var victim, out var expiry))
+            while (_bans.Count >= _maxTracked && _bansByExpiry.TryDequeue(out var victim, out var expiry))
             {
                 if (!_bans.TryGetValue(victim, out var ban) || ban.ExpiresAt != expiry)
                     continue;   // a stale entry: the ban was replaced or has already ended
@@ -327,7 +352,7 @@ public sealed class AuthBanManager
 
         // The queue is bounded: it never holds more entries than the ban table has bans. The entries of
         // the bans that have ended are dropped when it grows past the cap.
-        if (_bansByExpiry.Count >= MaxTrackedIps)
+        if (_bansByExpiry.Count >= _maxTracked)
             RebuildExpiryQueueLocked();
 
         _bans[ip] = new Ban { ExpiresAt = expiresAt };

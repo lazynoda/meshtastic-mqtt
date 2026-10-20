@@ -66,6 +66,7 @@ internal sealed class BoundedMap<TKey, TValue> where TKey : notnull
     readonly int _maxEntries;
     readonly Action? _onEvicted;
     long _evictions;
+    long _visits;
 
     public BoundedMap(int maxEntries, Action? onEvicted = null)
     {
@@ -77,6 +78,9 @@ internal sealed class BoundedMap<TKey, TValue> where TKey : notnull
 
     /// <summary>Entries evicted to stay under the cap.</summary>
     public long Evictions => Interlocked.Read(ref _evictions);
+
+    /// <summary>The entries the sweeps have visited so far (for tests).</summary>
+    public long Visits => Interlocked.Read(ref _visits);
 
     public bool TryGet(TKey key, out TValue value)
     {
@@ -123,13 +127,42 @@ internal sealed class BoundedMap<TKey, TValue> where TKey : notnull
         return true;
     }
 
-    /// <summary>A snapshot of the keys (for sweeps); the caller must not hold the table's lock.</summary>
+    /// <summary>
+    /// A snapshot of the keys (for sweeps). The caller holds the table's lock: the snapshot is taken
+    /// under it, and the table is not modified while it is being taken.
+    /// </summary>
     public List<TKey> Keys()
     {
         var keys = new List<TKey>(_map.Count);
         foreach (var node in _map.Values)
             keys.Add(node.Key);
         return keys;
+    }
+
+    /// <summary>
+    /// Removes the entries at the head of the order while the predicate holds, and stops at the first
+    /// entry that does not: the order is the insertion order, so the entries that are over are the
+    /// oldest ones and a sweep costs what it expires, not what the table holds.
+    /// </summary>
+    /// <param name="shouldRemove">Told the key and the value of each entry, oldest first.</param>
+    /// <returns>The number of entries that were visited.</returns>
+    /// <remarks>The caller holds the table's lock, and the predicate must not change the table.</remarks>
+    public long RemoveOldestWhile(Func<TKey, TValue, bool> shouldRemove)
+    {
+        long visited = 0;
+        while (true)
+        {
+            var oldest = _order.First;
+            if (oldest is null)
+                break;
+            visited++;
+            if (!shouldRemove(oldest.Value.Key, oldest.Value.Value))
+                break;
+            _order.RemoveFirst();
+            _map.Remove(oldest.Value.Key);
+        }
+        Interlocked.Add(ref _visits, visited);
+        return visited;
     }
 }
 

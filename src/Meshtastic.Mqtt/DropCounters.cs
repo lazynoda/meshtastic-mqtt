@@ -4,8 +4,9 @@ using Serilog;
 namespace Meshtastic.Mqtt;
 
 /// <summary>
-/// Counts dropped publishes per reason and logs the totals at Information on a fixed period, only when
-/// something was dropped. Per-packet drop lines are Debug, so a public publisher cannot flood the log.
+/// Counts what the broker refused (the dropped publishes, the refused connections) and what it evicted,
+/// per reason, and logs the totals at Information on a fixed period, only when something was counted.
+/// Per-packet drop lines are Debug, so a public publisher cannot flood the log.
 /// </summary>
 public sealed class DropCounters : IAsyncDisposable
 {
@@ -15,14 +16,16 @@ public sealed class DropCounters : IAsyncDisposable
     // dictionary stays small.
     readonly ConcurrentDictionary<string, long> _counts = new(StringComparer.Ordinal);
     readonly ILogger _log;
+    readonly TimeSpan _period;
     readonly CancellationTokenSource _stop = new();
     readonly Task? _loop;
 
     public DropCounters(ILogger log, TimeSpan? period = null, bool start = true)
     {
         _log = log;
+        _period = period ?? DefaultPeriod;
         if (start)
-            _loop = RunAsync(period ?? DefaultPeriod, _stop.Token);
+            _loop = RunAsync(_period, _stop.Token);
     }
 
     public void Increment(string reason)
@@ -54,7 +57,11 @@ public sealed class DropCounters : IAsyncDisposable
         }
         if (snapshot.Count == 0)
             return;
-        _log.Information("Dropped {Total} publish(es) in the last period by reason: {Drops}", snapshot.Values.Sum(), snapshot);
+        // The counters hold more than dropped publishes: refused connections and evictions too, so the
+        // line does not call them all publishes.
+        var breakdown = string.Join(", ", snapshot.Select(reason => $"{reason.Key}: {reason.Value}"));
+        _log.Information("Refused or evicted {Total} in the last {Seconds} s: {Drops}",
+            snapshot.Values.Sum(), (int)_period.TotalSeconds, breakdown);
     }
 
     async Task RunAsync(TimeSpan period, CancellationToken cancellationToken)
