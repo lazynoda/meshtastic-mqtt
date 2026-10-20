@@ -90,16 +90,21 @@ internal enum CompiledValueKind
 }
 
 /// <summary>A value of a condition, already checked against the type of its field.</summary>
+/// <remarks>
+/// A whole number is kept as an <see cref="Int128"/>: every integer of the protobufs (int32, int64,
+/// uint32, uint64, fixed, sfixed) fits in it exactly, so a 64-bit unsigned field with the high bit
+/// put is compared without an overflow.
+/// </remarks>
 internal readonly struct CompiledValue
 {
     public readonly CompiledValueKind Kind;
     public readonly string Text;
     public readonly double Number;
-    public readonly long Integer;
+    public readonly Int128 Integer;
     public readonly bool IsInteger;
     public readonly bool Bool;
 
-    CompiledValue(CompiledValueKind kind, string text, double number, long integer, bool isInteger, bool boolean)
+    CompiledValue(CompiledValueKind kind, string text, double number, Int128 integer, bool isInteger, bool boolean)
     {
         Kind = kind;
         Text = text;
@@ -112,7 +117,7 @@ internal readonly struct CompiledValue
     public static CompiledValue ForString(string text) =>
         new(CompiledValueKind.String, text, 0, 0, false, false);
 
-    public static CompiledValue ForNumber(double number, bool isInteger, long integer) =>
+    public static CompiledValue ForNumber(double number, bool isInteger, Int128 integer) =>
         new(CompiledValueKind.Number, string.Empty, number, integer, isInteger, false);
 
     public static CompiledValue ForBool(bool value) =>
@@ -295,30 +300,67 @@ internal sealed class FilterCondition
 
     static bool Numbers(object actual, CompiledValue expected)
     {
-        if (actual is float or double or decimal)
-            return Convert.ToDouble(actual) == expected.Number;
         if (actual is string)
             return false;
-        var number = Convert.ToInt64(actual);
-        return expected.IsInteger ? number == expected.Integer : (double)number == expected.Number;
+        // A float on one of the two sides: the two are compared as doubles.
+        if (actual is float or double or decimal)
+            return Convert.ToDouble(actual) == expected.Number;
+        if (!TryInteger(actual, out var number))
+            return false;
+        // Two whole numbers: they are compared exactly, whatever their size.
+        if (expected.IsInteger)
+            return number == expected.Integer;
+        return (double)number == expected.Number;
     }
 
     static int CompareNumbers(object? actual, CompiledValue expected)
     {
         if (actual is null)
             return int.MinValue;   // the field is not there: it never reaches here
-        double left, right;
+        // A float on one of the two sides: the two are compared as doubles.
         if (actual is float or double or decimal)
+            return Convert.ToDouble(actual).CompareTo(expected.Number);
+        if (!TryInteger(actual, out var number))
+            return int.MinValue;
+        // Two whole numbers: they are compared exactly, whatever their size.
+        if (expected.IsInteger)
+            return number.CompareTo(expected.Integer);
+        return ((double)number).CompareTo(expected.Number);
+    }
+
+    /// <summary>
+    /// The value of a numeric field as an exact integer. Every integer of the protobufs fits in an
+    /// <see cref="Int128"/>, so a 64-bit unsigned field with the high bit put is never an overflow.
+    /// The conversion never throws: a value that is not an integer is not a number.
+    /// </summary>
+    static bool TryInteger(object actual, out Int128 number)
+    {
+        switch (actual)
         {
-            left = Convert.ToDouble(actual);
-            right = expected.Number;
+            case sbyte value: number = value; return true;
+            case byte value: number = value; return true;
+            case short value: number = value; return true;
+            case ushort value: number = value; return true;
+            case int value: number = value; return true;
+            case uint value: number = value; return true;
+            case long value: number = value; return true;
+            case ulong value: number = value; return true;
+            case Enum value:
+                // The enums of the protobufs are int32, but an enum of a library may not be.
+                try
+                {
+                    number = Convert.ToInt64(value);
+                    return true;
+                }
+                catch (OverflowException)
+                {
+                    number = 0;
+                    return false;
+                }
+            default:
+                number = 0;
+                return false;
         }
-        else
-        {
-            left = Convert.ToInt64(actual);
-            right = expected.IsInteger ? expected.Integer : expected.Number;
-        }
-        return left.CompareTo(right);
     }
 }
 

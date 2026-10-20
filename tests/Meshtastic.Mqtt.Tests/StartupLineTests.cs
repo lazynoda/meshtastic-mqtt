@@ -68,7 +68,7 @@ public sealed class StartupLineTests
             try
             {
                 StartupLine.Write(logger, withFilters, withBuilt.Filter);
-                Assert.Contains("filters=on (1 rules)", Assert.Single(logs.Events).RenderMessage());
+                Assert.Contains("filters=on (1 rule)", Assert.Single(logs.Events).RenderMessage());
             }
             finally
             {
@@ -78,6 +78,54 @@ public sealed class StartupLineTests
         finally
         {
             FilterFixtures.Delete(file);
+        }
+    }
+
+    [Fact]
+    public void N2_TheStartupLine_PluralisesTheRules()
+    {
+        // One rule is "1 rule" and two rules are "2 rules".
+        var logs = new LogSink();
+        var logger = new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(logs).CreateLogger();
+
+        var one = FilterFixtures.WriteFile("""
+            users:
+              meshdev:
+                - name: only-iberia
+                  channels:
+                    allow: [Iberia]
+            """);
+        var two = FilterFixtures.WriteFile("""
+            users:
+              meshdev:
+                - name: only-iberia
+                  channels:
+                    allow: [Iberia]
+                - name: no-private
+                  channels:
+                    deny: [Private]
+            """);
+        try
+        {
+            foreach (var (file, expected) in new[] { (one, "filters=on (1 rule)"), (two, "filters=on (2 rules)") })
+            {
+                var config = FilterFixtures.Config(file);
+                var built = BrokerServer.Create(config, logger);
+                try
+                {
+                    StartupLine.Write(logger, config, built.Filter);
+                    Assert.Contains(expected, Assert.Single(logs.Events).RenderMessage());
+                }
+                finally
+                {
+                    built.Filter.Dispose();
+                }
+                logs.Events.Clear();
+            }
+        }
+        finally
+        {
+            FilterFixtures.Delete(one, two);
         }
     }
 }

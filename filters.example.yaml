@@ -1,14 +1,20 @@
 # Packet filters of the broker.
 #
-# Copy to filters.yaml (git-ignored) and point the config at it:
-#
-#   filters:
-#     file: /etc/meshtastic-mqtt/filters.yaml
-#     reload_check_seconds: 5
+# THIS FILE IS AN ILLUSTRATION of every feature of the rules file, not a starting point. Copied as it
+# is, it drops every text message of every user and every packet the broker cannot open (the
+# channels whose key it does not have and every direct message in PKI), and it stops the packets of
+# the public channels that are not in its lists. Start with an empty file (an empty file means no
+# rules) and write the rules you need.
 #
 # The file is read at startup and checked again every reload_check_seconds seconds: a change is
 # applied without a restart, and a file that is not valid keeps the rules that are already in force.
 # The whole file is English, the node ids are the documentation ones (!a1b2c3d4, !deadbeef).
+#
+# The config points at the file:
+#
+#   filters:
+#     file: /etc/meshtastic-mqtt/filters.yaml
+#     reload_check_seconds: 5
 
 # Three scopes, all optional: users (the user that owns the session), gateways (the gateway of the
 # topic) and nodes (the `from` of the packet). The key "*" applies to every user, gateway or node.

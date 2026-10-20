@@ -1,4 +1,7 @@
+using System.Globalization;
+using System.Text;
 using Google.Protobuf;
+using Google.Protobuf.Reflection;
 using Meshtastic.Mqtt;
 using Meshtastic.Protobufs;
 using Serilog;
@@ -121,6 +124,23 @@ static class FilterFixtures
         var battery = metricsField.MessageType!.FindFieldByName("battery_level")!;
         var value = Convert.ChangeType(batteryLevel, battery.Accessor.GetValue(metrics).GetType());
         battery.Accessor.SetValue(metrics, value);
+        metricsField.Accessor.SetValue(message, metrics);
+        return message.ToByteArray();
+    }
+
+    /// <summary>
+    /// The payload of a telemetry message with the free memory of the host. The message is built
+    /// through the descriptor of the protobuf, so the test does not depend on the name the generator
+    /// gives the nested messages.
+    /// </summary>
+    public static byte[] TelemetryWithFreeMem(ulong freeMemBytes)
+    {
+        var telemetry = FilterSchema.PayloadMessages[FilterSchema.TelemetryApp];
+        var metricsField = telemetry.FindFieldByName("host_metrics")!;
+        var message = (IMessage)Activator.CreateInstance(telemetry.ClrType)!;
+        var metrics = (IMessage)Activator.CreateInstance(metricsField.MessageType!.ClrType)!;
+        var freeMem = metricsField.MessageType!.FindFieldByName("freemem_bytes")!;
+        freeMem.Accessor.SetValue(metrics, freeMemBytes);
         metricsField.Accessor.SetValue(message, metrics);
         return message.ToByteArray();
     }
@@ -624,7 +644,19 @@ public sealed class FilterTests
     [InlineData("data.portnum", "in", "[POSITION_APP, TEXT_MESSAGE_APP]", true)]
     [InlineData("packet.want_ack", "eq", "false", true)]        // a boolean
     [InlineData("packet.want_ack", "ne", "true", true)]
-    public void R5_EveryOperator_OnAFieldOfItsType(string field, string op, string value, bool dropped)
+    // A uint64 with the high bit put (N8): the number is compared as it is, without an overflow.
+    [InlineData("payload.host_metrics.freemem_bytes", "eq", "18446744073709551615", true,
+        "TELEMETRY_APP", "telemetry")]
+    [InlineData("payload.host_metrics.freemem_bytes", "ne", "18446744073709551615", false,
+        "TELEMETRY_APP", "telemetry")]
+    [InlineData("payload.host_metrics.freemem_bytes", "lt", "100", false,
+        "TELEMETRY_APP", "telemetry")]
+    [InlineData("payload.host_metrics.freemem_bytes", "gt", "9223372036854775807", true,
+        "TELEMETRY_APP", "telemetry")]
+    [InlineData("payload.host_metrics.freemem_bytes", "in", "[18446744073709551615]", true,
+        "TELEMETRY_APP", "telemetry")]
+    public void R5_EveryOperator_OnAFieldOfItsType(string field, string op, string value, bool dropped,
+        string portnum = "TEXT_MESSAGE_APP", string packet = "text")
     {
         var file = FilterFixtures.WriteFile($$"""
             users:
@@ -634,7 +666,7 @@ public sealed class FilterTests
                     - field: {{field}}
                       op: {{op}}
                       value: {{value}}
-                      portnum: TEXT_MESSAGE_APP
+                      portnum: {{portnum}}
                   unopened: allow
             """);
         try
@@ -643,9 +675,12 @@ public sealed class FilterTests
             var (logger, _) = FilterFixtures.Logger();
             using var filter = new PacketFilter(config, logger, startWatcher: false);
 
-            var packet = FilterFixtures.TextPacket(config, "Test", FilterFixtures.Node, 42, FilterFixtures.Gateway, "hola");
+            var bytes = packet == "telemetry"
+                ? FilterFixtures.ChannelPacket(config, "Test", FilterFixtures.Node, 42, FilterFixtures.Gateway,
+                    PortNum.TelemetryApp, FilterFixtures.TelemetryWithFreeMem(ulong.MaxValue))
+                : FilterFixtures.TextPacket(config, "Test", FilterFixtures.Node, 42, FilterFixtures.Gateway, "hola");
             var verdict = filter.Evaluate(FilterFixtures.Input(config,
-                FilterFixtures.Topic("Test", FilterFixtures.Gateway), packet));
+                FilterFixtures.Topic("Test", FilterFixtures.Gateway), bytes));
             Assert.True(dropped == !verdict.Passed, $"{field} {op} {value}");
         }
         finally
@@ -958,5 +993,299 @@ public sealed class FilterTests
         {
             FilterFixtures.Delete(file);
         }
+    }
+
+    // ---- M1: the numbers of 64 bits ------------------------------------------------------------------------
+
+    [Fact]
+    public void M1_AUint64FieldWithTheHighBitSet_NeverThrows()
+    {
+        // The repro of the review: a uint64 with the high bit put (the free memory of the host of a
+        // node) must not throw an OverflowException when the rule is evaluated.
+        var file = FilterFixtures.WriteFile("""
+            users:
+              "*":
+                - name: too-little-memory
+                  drop_if:
+                    - field: payload.host_metrics.freemem_bytes
+                      op: lt
+                      value: 100
+                      portnum: TELEMETRY_APP
+                  unopened: allow
+            """);
+        try
+        {
+            var config = FilterFixtures.Config(file);
+            var (logger, _) = FilterFixtures.Logger();
+            using var filter = new PacketFilter(config, logger, startWatcher: false);
+
+            var packet = FilterFixtures.ChannelPacket(config, "Test", FilterFixtures.Node, 1, FilterFixtures.Gateway,
+                PortNum.TelemetryApp, FilterFixtures.TelemetryWithFreeMem(ulong.MaxValue));
+            var verdict = filter.Evaluate(FilterFixtures.Input(config,
+                FilterFixtures.Topic("Test", FilterFixtures.Gateway), packet));
+
+            // The rule is not failed by the condition: the packet passes.
+            Assert.True(verdict.Passed);
+        }
+        finally
+        {
+            FilterFixtures.Delete(file);
+        }
+    }
+
+    [Fact]
+    public void M1_AUint64FieldWithTheHighBitSet_IsComparedExactly()
+    {
+        var file = FilterFixtures.WriteFile("""
+            users:
+              "*":
+                - name: no-memory
+                  drop_if:
+                    - field: payload.host_metrics.freemem_bytes
+                      op: eq
+                      value: 18446744073709551615
+                      portnum: TELEMETRY_APP
+                    - field: payload.host_metrics.freemem_bytes
+                      op: gt
+                      value: 9223372036854775807
+                      portnum: TELEMETRY_APP
+                  unopened: allow
+            """);
+        try
+        {
+            var config = FilterFixtures.Config(file);
+            var (logger, _) = FilterFixtures.Logger();
+            using var filter = new PacketFilter(config, logger, startWatcher: false);
+
+            var packet = FilterFixtures.ChannelPacket(config, "Test", FilterFixtures.Node, 1, FilterFixtures.Gateway,
+                PortNum.TelemetryApp, FilterFixtures.TelemetryWithFreeMem(ulong.MaxValue));
+            var verdict = filter.Evaluate(FilterFixtures.Input(config,
+                FilterFixtures.Topic("Test", FilterFixtures.Gateway), packet));
+
+            // The two conditions are true: the rule fails and the packet is dropped.
+            Assert.False(verdict.Passed);
+            Assert.Equal("no-memory", verdict.RuleName);
+        }
+        finally
+        {
+            FilterFixtures.Delete(file);
+        }
+    }
+
+    [Fact]
+    public void M1_NoNumericFieldOfTheDecodedMessages_ThrowsInTheEvaluation()
+    {
+        // Every numeric field of the messages the filter decodes (the payload of every portnum it
+        // knows) is read with the extreme values of its type and with every operator: the evaluation
+        // never throws, so the catch of the publish hook never turns a packet into an internal error.
+        var fields = NumericFields().ToArray();
+        Assert.NotEmpty(fields);
+        var checkedFields = 0;
+        foreach (var (portnum, path, descriptor, chain) in fields)
+            checkedFields += CheckField("payload.", path, descriptor, chain, portnum);
+        Assert.True(checkedFields > 50, checkedFields.ToString(CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
+    public void M1_NoNumericFieldOfThePacketOrTheData_ThrowsInTheEvaluation()
+    {
+        // The same for the cleartext header of the packet and for the decoded data: every numeric
+        // field the loader accepts under `packet.` and under `data.`.
+        var packetFields = NumericLeaves(MeshPacket.Descriptor, "", []).ToArray();
+        var dataFields = NumericLeaves(Protobufs.Data.Descriptor, "", []).ToArray();
+        Assert.NotEmpty(packetFields);
+        Assert.NotEmpty(dataFields);
+        var checkedFields = 0;
+        foreach (var (path, chain) in packetFields)
+            checkedFields += CheckField("packet.", path, MeshPacket.Descriptor, chain, null);
+        foreach (var (path, chain) in dataFields)
+            checkedFields += CheckField("data.", path, Protobufs.Data.Descriptor, chain, null);
+        Assert.True(checkedFields > 20, checkedFields.ToString(CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>
+    /// Reads one field with every extreme value of its type and with every operator: the evaluation
+    /// never throws. It returns how many values it read.
+    /// </summary>
+    /// <param name="prefix">The prefix of the path: <c>packet.</c>, <c>data.</c> or <c>payload.</c>.</param>
+    /// <param name="path">The path of the field, without the prefix.</param>
+    /// <param name="descriptor">The message that holds the field.</param>
+    /// <param name="chain">The fields to walk, from the root of the message to the leaf.</param>
+    /// <param name="portnum">The portnum of the payload, when the field is in a payload.</param>
+    static int CheckField(string prefix, string path, MessageDescriptor descriptor, FieldDescriptor[] chain,
+        int? portnum)
+    {
+        var values = ExtremeValues(chain[^1]).ToArray();
+        foreach (var value in values)
+        {
+            var literal = LiteralOf(chain[^1], value);
+            var file = FilterFixtures.WriteFile(Rule(prefix, path, literal, portnum));
+            try
+            {
+                var config = FilterFixtures.Config(file);
+                var (logger, _) = FilterFixtures.Logger();
+                using var filter = new PacketFilter(config, logger, startWatcher: false);
+
+                try
+                {
+                    filter.Evaluate(InputWith(prefix, descriptor, chain, value, portnum));
+                }
+                catch (Exception ex)
+                {
+                    Assert.Fail($"the evaluation of '{prefix}{path}' with {literal} threw "
+                        + $"{ex.GetType().Name}: {ex.Message}");
+                }
+            }
+            finally
+            {
+                FilterFixtures.Delete(file);
+            }
+        }
+        return values.Length;
+    }
+
+    /// <summary>The rule that reads the field with every operator.</summary>
+    static string Rule(string prefix, string path, string literal, int? portnum)
+    {
+        var field = prefix + path;
+        var builder = new StringBuilder();
+        builder.AppendLine("users:");
+        builder.AppendLine("  \"*\":");
+        builder.AppendLine("    - name: the-rule");
+        builder.AppendLine("      drop_if:");
+        foreach (var op in new[] { "eq", "ne", "in", "lt", "le", "gt", "ge" })
+        {
+            builder.AppendLine($"        - field: {field}");
+            builder.AppendLine($"          op: {op}");
+            builder.AppendLine(op == "in" ? $"          value: [{literal}]" : $"          value: {literal}");
+            if (portnum is not null)
+                builder.AppendLine($"          portnum: {FilterSchema.PortNumName(portnum.Value)}");
+        }
+        builder.AppendLine("      unopened: allow");
+        return builder.ToString();
+    }
+
+    /// <summary>The input of a packet that holds the value in the field.</summary>
+    static FilterInput InputWith(string prefix, MessageDescriptor descriptor, FieldDescriptor[] chain, object value,
+        int? portnum)
+    {
+        var message = Build(descriptor, chain, value);
+        var packet = new MeshPacket { From = FilterFixtures.Node, Id = 1, To = uint.MaxValue };
+        Protobufs.Data? data = null;
+        if (prefix == "packet.")
+        {
+            packet = (MeshPacket)message;
+        }
+        else if (prefix == "data.")
+        {
+            data = (Protobufs.Data)message;
+            packet.Decoded = data;
+        }
+        else
+        {
+            data = new Protobufs.Data { Portnum = (PortNum)portnum!.Value, Payload = message.ToByteString() };
+            packet.Decoded = data;
+        }
+        return new FilterInput("meshdev", "!a1b2c3d4", 0xa1b2c3d4, FilterFixtures.Node, "Test",
+            FilterFixtures.Topic("Test", FilterFixtures.Gateway), packet, data,
+            portnum is null ? PortNum.TextMessageApp : (PortNum)portnum.Value);
+    }
+
+    /// <summary>Every numeric field of the messages the filter decodes, with the chain to reach it.</summary>
+    static IEnumerable<(int Portnum, string Path, MessageDescriptor Descriptor, FieldDescriptor[] Chain)>
+        NumericFields()
+    {
+        foreach (var (portnum, descriptor) in FilterSchema.PayloadMessages)
+        {
+            foreach (var (path, chain) in NumericLeaves(descriptor, "", []))
+                yield return (portnum, path, descriptor, chain);
+        }
+    }
+
+    /// <summary>The numeric fields of a message, and of the messages it holds.</summary>
+    static IEnumerable<(string Path, FieldDescriptor[] Chain)> NumericLeaves(MessageDescriptor descriptor,
+        string prefix, FieldDescriptor[] chain)
+    {
+        foreach (var field in descriptor.Fields.InFieldNumberOrder())
+        {
+            if (field.IsRepeated || field.FieldType == FieldType.Bytes)
+                continue;   // a list and a text are not numbers
+            var path = chain.Append(field).ToArray();
+            if (field.FieldType is FieldType.Message or FieldType.Group)
+            {
+                foreach (var nested in NumericLeaves(field.MessageType!, $"{prefix}{field.Name}.", path))
+                    yield return nested;
+                continue;
+            }
+            if (!IsNumeric(field.FieldType) && field.FieldType != FieldType.Enum)
+                continue;
+            yield return ($"{prefix}{field.Name}", path);
+        }
+    }
+
+    /// <summary>Whether the type of the field is a number.</summary>
+    static bool IsNumeric(FieldType type) => type is FieldType.Int32 or FieldType.Int64 or FieldType.UInt32
+        or FieldType.UInt64 or FieldType.SInt32 or FieldType.SInt64 or FieldType.Fixed32 or FieldType.Fixed64
+        or FieldType.SFixed32 or FieldType.SFixed64 or FieldType.Float or FieldType.Double;
+
+    /// <summary>The message with the value in the field.</summary>
+    static IMessage Build(MessageDescriptor descriptor, FieldDescriptor[] chain, object value)
+    {
+        var message = (IMessage)Activator.CreateInstance(descriptor.ClrType)!;
+        var current = message;
+        for (var i = 0; i < chain.Length - 1; i++)
+        {
+            var child = (IMessage)Activator.CreateInstance(chain[i].MessageType!.ClrType)!;
+            chain[i].Accessor.SetValue(current, child);
+            current = child;
+        }
+        chain[^1].Accessor.SetValue(current, value);
+        return message;
+    }
+
+    /// <summary>
+    /// The extreme values of a numeric field: both ends of its type, and the numbers that are not
+    /// numbers for the fields of floating point.
+    /// </summary>
+    static IEnumerable<object> ExtremeValues(FieldDescriptor field) => field.FieldType switch
+    {
+        FieldType.UInt64 => new object[] { ulong.MaxValue },
+        FieldType.Fixed64 => new object[] { ulong.MaxValue },
+        FieldType.Int64 => new object[] { long.MinValue, long.MaxValue },
+        FieldType.SInt64 => new object[] { long.MinValue, long.MaxValue },
+        FieldType.SFixed64 => new object[] { long.MinValue, long.MaxValue },
+        FieldType.UInt32 => new object[] { uint.MaxValue },
+        FieldType.Fixed32 => new object[] { uint.MaxValue },
+        FieldType.Int32 => new object[] { int.MinValue, int.MaxValue },
+        FieldType.SInt32 => new object[] { int.MinValue, int.MaxValue },
+        FieldType.SFixed32 => new object[] { int.MinValue, int.MaxValue },
+        FieldType.Float => new object[] { float.MaxValue, float.MinValue, float.NaN },
+        FieldType.Double => new object[] { double.MaxValue, double.MinValue, double.NaN },
+        // An enum holds a number: a value that has no name is a number like any other.
+        FieldType.Enum => new object[]
+        {
+            Enum.ToObject(field.EnumType!.ClrType, int.MaxValue),
+            Enum.ToObject(field.EnumType!.ClrType, int.MinValue),
+        },
+        _ => Array.Empty<object>(),
+    };
+
+    /// <summary>The value of the rule, as the file writes it.</summary>
+    static string LiteralOf(FieldDescriptor field, object value)
+    {
+        // The numbers of an enum are compared by their number: the value of the rule is a number the
+        // portnum range accepts (the field of the portnum is the only one that has a range).
+        if (field.FieldType == FieldType.Enum)
+            return "1";
+        return value switch
+        {
+            ulong number => number.ToString(CultureInfo.InvariantCulture),
+            long number => number.ToString(CultureInfo.InvariantCulture),
+            uint number => number.ToString(CultureInfo.InvariantCulture),
+            int number => number.ToString(CultureInfo.InvariantCulture),
+            float number => number.ToString(CultureInfo.InvariantCulture),
+            double number => number.ToString(CultureInfo.InvariantCulture),
+            _ => "1",
+        };
     }
 }

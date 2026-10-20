@@ -24,7 +24,7 @@ internal static class StartupLine
         // rules they hold. A broker without a rules file has no filters, even though it holds a filter
         // object (the one that watches a file that is not there). The number of rules is written as
         // the reload line writes it.
-        var filters = filter is null || !filter.Enabled ? "off" : $"on ({filter.RuleCount} rules)";
+        var filters = filter is null || !filter.Enabled ? "off" : $"on ({FilterSchema.Rules(filter.RuleCount)})";
         log.ForContext(OrderedProperties.Enricher("LimitValues", limitValues))
             .Information("Listening on {Address:l}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_pki={DropPki}, filters={Filters:l}, limits: {Limits:l}",
                 config.BindAddress, config.Listener.Port, config.Users!.Count, config.ChannelKeyMap.Count,

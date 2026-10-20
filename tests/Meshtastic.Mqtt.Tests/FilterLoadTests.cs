@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text;
 using Meshtastic.Mqtt;
 using Xunit;
 
@@ -578,6 +580,398 @@ public sealed class FilterLoadTests
         Assert.Equal(
             FilterSchema.Ops.OrderBy(op => op, StringComparer.Ordinal),
             Enum.GetNames<FilterOp>().Select(op => op.ToLowerInvariant()).OrderBy(op => op, StringComparer.Ordinal));
+    }
+
+    // ---- M2: the budgets of the file ------------------------------------------------------------------------
+
+    [Fact]
+    public void M2_AnAliasExplosion_IsALoadErrorAndTheLoadStopsAtTheBudget()
+    {
+        // The repro of the review: the aliases of the YAML multiply the values of the file. The file is
+        // small, but the values it holds are not: the load stops at the budget of the values.
+        var values = string.Join(", ", Enumerable.Range(0, 1000)
+            .Select(i => i.ToString(CultureInfo.InvariantCulture)));
+        var builder = new StringBuilder();
+        builder.AppendLine("users:");
+        builder.AppendLine("  meshdev:");
+        builder.AppendLine("    - name: the-first");
+        builder.AppendLine("      drop_if:");
+        builder.AppendLine("        - &cond");
+        builder.AppendLine("          field: packet.id");
+        builder.AppendLine("          op: in");
+        builder.AppendLine($"          value: [{values}]");
+        for (var i = 0; i < 49; i++)
+            builder.AppendLine("        - *cond");
+        builder.AppendLine("      unopened: allow");
+        for (var i = 0; i < 199; i++)
+        {
+            builder.AppendLine($"    - name: rule-{i}");
+            builder.AppendLine("      drop_if:");
+            for (var j = 0; j < 50; j++)
+                builder.AppendLine("        - *cond");
+            builder.AppendLine("      unopened: allow");
+        }
+        var yaml = builder.ToString();
+
+        // The file is small: it is the aliases that make it hold ten million values.
+        Assert.True(yaml.Length < 512 * 1024, yaml.Length.ToString(CultureInfo.InvariantCulture));
+
+        var ex = Assert.Throws<FilterException>(() => FilterLoader.Parse(yaml, Users, "filters.yaml"));
+        Assert.Contains("budget", ex.Message);
+        Assert.Contains(FilterLoader.MaxCompiledValues.ToString(CultureInfo.InvariantCulture), ex.Message);
+        // The load stopped at the budget: it did not compile the ten million values of the file.
+        Assert.True(ex.CompiledValues <= FilterLoader.MaxCompiledValues + 1,
+            $"the loader compiled {ex.CompiledValues} values");
+    }
+
+    [Fact]
+    public void M2_AFileBiggerThanTheBudgetOfTheSize_IsALoadError()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"mmqtt-filters-{Guid.NewGuid():N}.yaml");
+        try
+        {
+            // A file of more than 1 MiB: it is not even parsed.
+            var builder = new StringBuilder("users:\n  meshdev:\n");
+            while (builder.Length <= FilterLoader.MaxFileBytes)
+                builder.Append("    - name: rule\n      channels:\n        allow: [Iberia]\n");
+            File.WriteAllText(path, builder.ToString());
+            Assert.True(new FileInfo(path).Length > FilterLoader.MaxFileBytes);
+
+            var ex = Assert.Throws<FilterException>(() => FilterLoader.LoadFile(path, Users));
+            Assert.Contains("bigger than", ex.Message);
+            Assert.Contains(FilterLoader.MaxFileBytes.ToString(CultureInfo.InvariantCulture), ex.Message);
+        }
+        finally
+        {
+            FilterFixtures.Delete(path);
+        }
+    }
+
+    [Fact]
+    public void M2_AFileExactlyAtTheBudgetOfTheRules_Loads()
+    {
+        // The rules are spread over the scopes: a scope key holds at most 1000 rules.
+        var builder = new StringBuilder("gateways:\n");
+        var index = 0;
+        for (var scope = 1; scope <= 10; scope++)
+        {
+            builder.Append($"  \"!{scope:x8}\":\n");
+            for (var i = 0; i < 1000; i++, index++)
+                builder.Append($"    - name: rule-{index}\n      channels:\n        allow: [Iberia]\n");
+        }
+
+        var ruleset = FilterLoader.Parse(builder.ToString(), Users, "filters.yaml");
+        Assert.Equal(FilterLoader.MaxRules, ruleset.RuleCount);
+    }
+
+    [Fact]
+    public void M2_AFileExactlyAtTheBudgetOfTheConditions_Loads()
+    {
+        // The conditions come from the aliases: the file holds a hundred thousand conditions and it is
+        // still small.
+        var builder = new StringBuilder();
+        builder.AppendLine("gateways:");
+        builder.AppendLine("  \"!00000001\":");
+        builder.AppendLine("    - name: the-first");
+        builder.AppendLine("      drop_if:");
+        builder.AppendLine("        - &cond");
+        builder.AppendLine("          field: packet.id");
+        builder.AppendLine("          op: eq");
+        builder.AppendLine("          value: 1");
+        for (var i = 0; i < 49; i++)
+            builder.AppendLine("        - *cond");
+        builder.AppendLine("      unopened: allow");
+        var aliases = string.Join(", ", Enumerable.Repeat("*cond", 50));
+        for (var i = 0; i < 999; i++)
+        {
+            builder.AppendLine($"    - name: rule-1-{i}");
+            builder.AppendLine($"      drop_if: [{aliases}]");
+            builder.AppendLine("      unopened: allow");
+        }
+        builder.AppendLine("  \"!00000002\":");
+        for (var i = 0; i < 1000; i++)
+        {
+            builder.AppendLine($"    - name: rule-2-{i}");
+            builder.AppendLine($"      drop_if: [{aliases}]");
+            builder.AppendLine("      unopened: allow");
+        }
+        var yaml = builder.ToString();
+        Assert.True(yaml.Length < FilterLoader.MaxFileBytes, yaml.Length.ToString(CultureInfo.InvariantCulture));
+
+        var ruleset = FilterLoader.Parse(yaml, Users, "filters.yaml");
+        Assert.Equal(2000, ruleset.RuleCount);
+    }
+
+    [Fact]
+    public void M2_AFileExactlyAtTheBudgetOfTheValues_Loads()
+    {
+        // A million values, through the aliases: a thousand rules with a list of a thousand values.
+        var values = string.Join(", ", Enumerable.Range(0, 1000)
+            .Select(i => i.ToString(CultureInfo.InvariantCulture)));
+        var builder = new StringBuilder();
+        builder.AppendLine("gateways:");
+        builder.AppendLine("  \"!00000001\":");
+        builder.AppendLine("    - name: the-first");
+        builder.AppendLine("      drop_if:");
+        builder.AppendLine("        - field: packet.id");
+        builder.AppendLine("          op: in");
+        builder.AppendLine($"          value: &vals [{values}]");
+        builder.AppendLine("      unopened: allow");
+        for (var i = 0; i < 499; i++)
+        {
+            builder.AppendLine($"    - name: rule-1-{i}");
+            builder.AppendLine("      drop_if:");
+            builder.AppendLine("        - field: packet.id");
+            builder.AppendLine("          op: in");
+            builder.AppendLine("          value: *vals");
+            builder.AppendLine("      unopened: allow");
+        }
+        builder.AppendLine("  \"!00000002\":");
+        for (var i = 0; i < 500; i++)
+        {
+            builder.AppendLine($"    - name: rule-2-{i}");
+            builder.AppendLine("      drop_if:");
+            builder.AppendLine("        - field: packet.id");
+            builder.AppendLine("          op: in");
+            builder.AppendLine("          value: *vals");
+            builder.AppendLine("      unopened: allow");
+        }
+        var yaml = builder.ToString();
+        Assert.True(yaml.Length < FilterLoader.MaxFileBytes, yaml.Length.ToString(CultureInfo.InvariantCulture));
+
+        var ruleset = FilterLoader.Parse(yaml, Users, "filters.yaml");
+        Assert.Equal(1000, ruleset.RuleCount);
+    }
+
+    [Fact]
+    public void M2_AFileExactlyAtTheBudgetOfTheSize_Loads()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"mmqtt-filters-{Guid.NewGuid():N}.yaml");
+        try
+        {
+            // A file of exactly 1 MiB: it loads. The rules are the ones of the budget of the rules and
+            // the rest of the file is a comment.
+            var builder = new StringBuilder("gateways:\n");
+            var index = 0;
+            for (var scope = 1; scope <= 10; scope++)
+            {
+                builder.Append($"  \"!{scope:x8}\":\n");
+                for (var i = 0; i < 1000; i++, index++)
+                    builder.Append($"    - name: rule-{index}\n      channels:\n        allow: [Iberia]\n");
+            }
+            var remaining = FilterLoader.MaxFileBytes - builder.Length;
+            Assert.True(remaining >= 3);
+            builder.Append('#').Append(new string('x', remaining - 2)).Append('\n');
+            Assert.Equal(FilterLoader.MaxFileBytes, builder.Length);
+            File.WriteAllText(path, builder.ToString());
+
+            var ruleset = FilterLoader.LoadFile(path, Users);
+            Assert.Equal(FilterLoader.MaxRules, ruleset.RuleCount);
+        }
+        finally
+        {
+            FilterFixtures.Delete(path);
+        }
+    }
+
+    // ---- N3: the prefixes of the paths ----------------------------------------------------------------------
+
+    [Fact]
+    public void N3_ThePrefixesTheLoaderAccepts_AreTheOnesOfTheSchema()
+    {
+        // The loader takes the prefixes of the schema, and the doc-drift test derives the check of the
+        // documentation from them: the two never drift apart.
+        Assert.Equal(
+            FilterSchema.FieldPrefixes.OrderBy(prefix => prefix, StringComparer.Ordinal),
+            FilterLoader.AcceptedFieldPrefixes.OrderBy(prefix => prefix, StringComparer.Ordinal));
+
+        foreach (var prefix in FilterSchema.FieldPrefixes)
+        {
+            Assert.Contains(prefix, FilterLoader.AcceptedFieldPrefixes);
+            // The loader reads a field with that prefix.
+            Assert.True(AnyFieldOfThePrefixIsRead(prefix), prefix);
+        }
+
+        // And a prefix that is not one of the schema is refused.
+        Assert.False(FilterLoader.TryBuildPath("envelope.gateway_id", null, out _, out _, out var error));
+        Assert.Contains("must start with", error);
+    }
+
+    /// <summary>Whether the loader reads a field with the prefix.</summary>
+    static bool AnyFieldOfThePrefixIsRead(string prefix)
+    {
+        foreach (var field in new[] { "id", "portnum", "text" })
+        {
+            if (FilterLoader.TryBuildPath(prefix + field, FilterSchema.TextMessageApp, out _, out _, out _))
+                return true;
+        }
+        return false;
+    }
+
+    // ---- N6: the numbers of the portnums -------------------------------------------------------------------
+
+    [Fact]
+    public void N6_APortnumNumberOutOfRange_IsALoadError()
+    {
+        // The range of the portnums is the one of the protobufs (the MAX of the enum).
+        Assert.Equal(511, FilterSchema.MaxPortNum);
+
+        var message = Message("""
+            users:
+              meshdev:
+                - name: bad-portnum
+                  portnums:
+                    allow: [9999]
+                  unopened: drop
+            """);
+        Assert.Contains("bad-portnum", message);
+        Assert.Contains("9999", message);
+        Assert.Contains("portnum", message);
+    }
+
+    [Fact]
+    public void N6_APortnumNumberInRangeWithoutAName_IsAccepted()
+    {
+        // A number inside the range of the protobufs is a portnum, even when the firmware has no name
+        // for it.
+        var ruleset = FilterLoader.Parse("""
+            users:
+              meshdev:
+                - name: a-number
+                  portnums:
+                    allow: [499]
+                  unopened: drop
+            """, Users, "filters.yaml");
+        Assert.Equal(1, ruleset.RuleCount);
+    }
+
+    [Fact]
+    public void N6_AConditionWithAPortnumNumberOutOfRange_IsALoadError()
+    {
+        var message = Message("""
+            users:
+              meshdev:
+                - name: bad-portnum
+                  drop_if:
+                    - field: payload.text
+                      op: contains
+                      value: hola
+                      portnum: 9999
+                  unopened: allow
+            """);
+        Assert.Contains("bad-portnum", message);
+        Assert.Contains("9999", message);
+    }
+
+    [Fact]
+    public void N6_AValueOfThePortnumOutOfRange_IsALoadError()
+    {
+        var message = Message("""
+            users:
+              meshdev:
+                - name: bad-value
+                  drop_if:
+                    - field: data.portnum
+                      op: eq
+                      value: 9999
+                  unopened: allow
+            """);
+        Assert.Contains("bad-value", message);
+        Assert.Contains("9999", message);
+
+        var inList = Message("""
+            users:
+              meshdev:
+                - name: bad-list
+                  drop_if:
+                    - field: data.portnum
+                      op: in
+                      value: [1, 9999]
+                  unopened: allow
+            """);
+        Assert.Contains("bad-list", inList);
+        Assert.Contains("9999", inList);
+    }
+
+    [Fact]
+    public void N6_AValueOfThePortnumInRange_IsAccepted()
+    {
+        var ruleset = FilterLoader.Parse("""
+            users:
+              meshdev:
+                - name: a-number
+                  drop_if:
+                    - field: data.portnum
+                      op: in
+                      value: [1, 499]
+                  unopened: allow
+                - name: a-threshold
+                  drop_if:
+                    - field: data.portnum
+                      op: lt
+                      value: 512
+                  unopened: allow
+            """, Users, "filters.yaml");
+        Assert.Equal(2, ruleset.RuleCount);
+    }
+
+    // ---- M1: the range of the whole numbers -----------------------------------------------------------------
+
+    [Fact]
+    public void M1_AWholeNumberOutOfRange_IsALoadError()
+    {
+        // A whole number that does not fit in the range of the file (between long.MinValue and
+        // ulong.MaxValue) is not a value the filter can compare with.
+        var tooBig = Message("""
+            users:
+              meshdev:
+                - name: too-big
+                  drop_if:
+                    - field: packet.id
+                      op: eq
+                      value: 18446744073709551616
+            """);
+        Assert.Contains("too-big", tooBig);
+        Assert.Contains("out of range", tooBig);
+
+        var tooSmall = Message("""
+            users:
+              meshdev:
+                - name: too-small
+                  drop_if:
+                    - field: packet.id
+                      op: eq
+                      value: -9223372036854775809
+            """);
+        Assert.Contains("too-small", tooSmall);
+        Assert.Contains("out of range", tooSmall);
+
+        var inAList = Message("""
+            users:
+              meshdev:
+                - name: too-big-in-a-list
+                  drop_if:
+                    - field: packet.id
+                      op: in
+                      value: [1, 18446744073709551616]
+            """);
+        Assert.Contains("too-big-in-a-list", inAList);
+        Assert.Contains("out of range", inAList);
+    }
+
+    [Fact]
+    public void M1_AWholeNumberAtTheEndsOfTheRange_Loads()
+    {
+        var ruleset = FilterLoader.Parse("""
+            users:
+              meshdev:
+                - name: the-ends
+                  drop_if:
+                    - field: packet.id
+                      op: in
+                      value: [18446744073709551615, -9223372036854775808]
+            """, Users, "filters.yaml");
+        Assert.Equal(1, ruleset.RuleCount);
     }
 
     // ---- the file itself -------------------------------------------------------------------------------------

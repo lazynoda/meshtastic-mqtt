@@ -74,6 +74,9 @@ public static class FilterSchema
     /// <summary>The names of the messages the payload of a portnum is decoded as, sorted.</summary>
     public static readonly IReadOnlyList<string> PayloadMessageNames;
 
+    /// <summary>The highest number a portnum may have (the range of the protobufs).</summary>
+    public static readonly int MaxPortNum;
+
     /// <summary>The number of every portnum, by the name the firmware writes (TEXT_MESSAGE_APP).</summary>
     static readonly Dictionary<string, int> PortNumNumbers;
 
@@ -136,7 +139,27 @@ public static class FilterSchema
             .Select(descriptor => descriptor.Name)
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToArray();
+
+        MaxPortNum = MaxPortNumOf();
     }
+
+    /// <summary>
+    /// The highest number a portnum may have. The enum of the protobufs has a MAX member, and its
+    /// value is the bound; the range of the firmware is the fallback.
+    /// </summary>
+    static int MaxPortNumOf()
+    {
+        var max = typeof(PortNum).GetField("Max", BindingFlags.Public | BindingFlags.Static);
+        if (max is not null)
+            return Convert.ToInt32(max.GetValue(null));
+        return 511;
+    }
+
+    /// <summary>The number of rules and its word: "1 rule", "2 rules".</summary>
+    public static string Rules(int count) => $"{count} {RuleWord(count)}";
+
+    /// <summary>The word of a number of rules: "rule" or "rules".</summary>
+    public static string RuleWord(int count) => count == 1 ? "rule" : "rules";
 
     /// <summary>The name of a portnum as the firmware writes it (TEXT_MESSAGE_APP).</summary>
     public static string PortNumName(int portnum) =>
@@ -153,6 +176,12 @@ public static class FilterSchema
         return int.TryParse(name, System.Globalization.NumberStyles.Integer,
             System.Globalization.CultureInfo.InvariantCulture, out number);
     }
+
+    /// <summary>
+    /// Whether the number is a portnum of the firmware (0 to <see cref="MaxPortNum"/>). A number
+    /// outside the range is not a portnum, whatever the file says.
+    /// </summary>
+    public static bool IsPortNumNumber(int number) => number >= 0 && number <= MaxPortNum;
 
     /// <summary>The node id of a node number, as the firmware writes it (! and 8 lowercase hex digits).</summary>
     public static string NodeId(uint node) => $"!{node:x8}";

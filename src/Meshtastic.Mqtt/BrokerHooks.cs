@@ -708,7 +708,7 @@ public sealed class BrokerHooks
         Drops.IncrementRaw(reason);
         _log.Debug("Dropped publish on {Topic} from {ClientId}: {Reason:l} (scope {Scope:l}, key {ScopeKey:l}, channel {Channel:l}, from {From}, id {PacketId}, gateway {Gateway:l})",
             Trim(topic), Trim(args.ClientId), reason, Trim(verdict.Scope), Trim(verdict.ScopeKey),
-            result.Channel, NodeId(result.From), result.PacketId, result.Gateway);
+            Trim(result.Channel), NodeId(result.From), result.PacketId, result.Gateway);
     }
 
     static string NodeId(uint node) => $"!{node:x8}";

@@ -16,7 +16,19 @@ public sealed class FilterException(IReadOnlyList<string> errors)
 {
     /// <summary>Every problem of the file, one per line.</summary>
     public IReadOnlyList<string> Errors { get; } = errors;
+
+    /// <summary>
+    /// How many values the loader had compiled when it refused the file. It is the budget of the
+    /// values of the file, and the tests use it to check that the load stops at the budget.
+    /// </summary>
+    internal int CompiledValues { get; init; }
 }
+
+/// <summary>
+/// The file is over one of its budgets: the load stops at once, without compiling the rest of the
+/// file.
+/// </summary>
+sealed class FilterBudgetException(string message) : Exception(message);
 
 /// <summary>
 /// Reads the rules file and compiles it into a <see cref="FilterRuleset"/>.
@@ -33,6 +45,20 @@ public static class FilterLoader
 
     /// <summary>The most items a list of the file may hold.</summary>
     public const int MaxListItems = 1_000;
+
+    /// <summary>
+    /// The most conditions a file may hold, counted after the aliases are expanded.
+    /// </summary>
+    public const int MaxConditions = 100_000;
+
+    /// <summary>
+    /// The most values a file may compile (the items of the lists of channels, topics and portnums
+    /// and the values of the operator <c>in</c>), counted after the aliases are expanded.
+    /// </summary>
+    public const int MaxCompiledValues = 1_000_000;
+
+    /// <summary>The most bytes a file may have.</summary>
+    public const int MaxFileBytes = 1_048_576;
 
     /// <summary>The most characters of a string value of the file.</summary>
     public const int MaxValueLength = 512;
@@ -72,6 +98,11 @@ public static class FilterLoader
         string yaml;
         try
         {
+            var info = new System.IO.FileInfo(path);
+            if (info.Exists && info.Length > MaxFileBytes)
+            {
+                throw new FilterException([$"{path}: {SizeMessage(info.Length)}"]);
+            }
             yaml = File.ReadAllText(path);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -87,6 +118,11 @@ public static class FilterLoader
     /// <param name="source">The name of the file, as the messages of the errors write it.</param>
     public static FilterRuleset Parse(string yaml, IReadOnlyCollection<string> knownUsers, string source = "filters.yaml")
     {
+        // The size of the file is checked before parsing it: a file that is too big is not read.
+        var size = System.Text.Encoding.UTF8.GetByteCount(yaml);
+        if (size > MaxFileBytes)
+            throw new FilterException([$"{source}: {SizeMessage(size)}"]);
+
         var builder = new RulesetBuilder(knownUsers, source);
         try
         {
@@ -94,6 +130,11 @@ public static class FilterLoader
             stream.Load(new StringReader(yaml));
             foreach (var document in stream.Documents)
                 builder.ReadDocument(document);
+        }
+        catch (FilterBudgetException ex)
+        {
+            // The file is over one of its budgets: the load stops at once.
+            builder.Errors.Add(ex.Message);
         }
         catch (YamlException ex)
         {
@@ -105,9 +146,13 @@ public static class FilterLoader
             builder.Errors.Add($"{source}: the file cannot be read: {ex.Message}");
         }
         if (builder.Errors.Count > 0)
-            throw new FilterException(builder.Errors);
+            throw new FilterException(builder.Errors) { CompiledValues = builder.CompiledValues };
         return builder.Build();
     }
+
+    /// <summary>The message of a file that is over the budget of its size.</summary>
+    static string SizeMessage(long size) =>
+        $"the file is bigger than {MaxFileBytes} bytes (the budget of the size is {MaxFileBytes} bytes, the file has {size})";
 
     /// <summary>
     /// Walks the parts of a path in the descriptor of a protobuf and checks every one of them: a
@@ -165,6 +210,100 @@ public static class FilterLoader
         return true;
     }
 
+    /// <summary>
+    /// The prefixes of the path of a field the loader accepts. They are the ones of the schema: the
+    /// loader and the documentation never drift apart.
+    /// </summary>
+    internal static IReadOnlyList<string> AcceptedFieldPrefixes => FilterSchema.FieldPrefixes;
+
+    /// <summary>
+    /// Builds the path of a field and checks it against the protobuf it belongs to.
+    /// </summary>
+    /// <param name="field">The path of the field, with its prefix.</param>
+    /// <param name="portnum">The portnum of the condition (the payload is decoded as its message).</param>
+    /// <param name="path">The path of the field, when it is read.</param>
+    /// <param name="needsOpening">Whether the path needs a packet the broker could open.</param>
+    /// <param name="error">Why the path is not read.</param>
+    internal static bool TryBuildPath(string field, int? portnum, out FieldPath path, out bool needsOpening,
+        out string error)
+    {
+        path = new FieldPath();
+        needsOpening = false;
+        error = string.Empty;
+
+        // The prefixes are the ones of the schema: the loader and the documentation never drift apart.
+        var prefix = FilterSchema.FieldPrefixes
+            .FirstOrDefault(candidate => field.StartsWith(candidate, StringComparison.Ordinal));
+        if (prefix is null)
+        {
+            error = $"the field must start with one of {string.Join(", ", FilterSchema.FieldPrefixes)}";
+            return false;
+        }
+
+        MessageDescriptor root;
+        var rest = field[prefix.Length..];
+        switch (prefix)
+        {
+            case "packet.":
+                root = MeshPacket.Descriptor;
+                break;
+            case "data.":
+                root = Protobufs.Data.Descriptor;
+                needsOpening = true;
+                break;
+            case "payload.":
+                needsOpening = true;
+                if (portnum is null)
+                {
+                    error = "a payload condition needs a portnum (the payload is decoded as the message "
+                        + "of its portnum)";
+                    return false;
+                }
+                if (portnum == FilterSchema.TextMessageApp)
+                {
+                    if (rest != "text")
+                    {
+                        error = "the payload of a TEXT_MESSAGE_APP is text: the only field of it is 'text'";
+                        return false;
+                    }
+                    path.Prefix = "payload";
+                    path.IsText = true;
+                    path.Kind = CompiledValueKind.String;
+                    return true;
+                }
+                if (!FilterSchema.PayloadMessages.TryGetValue(portnum.Value, out var descriptor))
+                {
+                    error = $"the portnum '{FilterSchema.PortNumName(portnum.Value)}' has no payload the filter "
+                        + $"can decode (the decoded ones are {string.Join(", ", FilterSchema.PayloadPortnumNames)})";
+                    return false;
+                }
+                root = descriptor;
+                break;
+            default:
+                error = $"the prefix '{prefix}' is not handled by the loader";
+                return false;
+        }
+
+        var parts = rest.Split('.');
+        if (!TryWalkFields(root, parts, out var fields, out error))
+            return false;
+
+        path.Prefix = prefix.TrimEnd('.');
+        path.Fields = fields;
+        path.Kind = KindOf(fields[^1]);
+        path.Leaf = fields[^1];
+        return true;
+    }
+
+    /// <summary>The kind of the value a field holds.</summary>
+    static CompiledValueKind KindOf(FieldDescriptor field) => field.FieldType switch
+    {
+        FieldType.Bool => CompiledValueKind.Bool,
+        FieldType.String => CompiledValueKind.String,
+        FieldType.Enum => CompiledValueKind.Enum,
+        _ => CompiledValueKind.Number,
+    };
+
     /// <summary>The kind of a scalar of the file, as the YAML resolves it.</summary>
     enum ScalarKind
     {
@@ -188,6 +327,8 @@ public static class FilterLoader
         List<FilterRule>? _gatewaysStar;
         List<FilterRule>? _nodesStar;
         int _ruleCount;
+        int _conditionCount;
+        int _compiledValueCount;
         int _userRules;
         int _gatewayRules;
         int _nodeRules;
@@ -201,11 +342,36 @@ public static class FilterLoader
         /// <summary>Every problem of the file, one per line.</summary>
         public List<string> Errors { get; } = [];
 
+        /// <summary>How many values the file has compiled so far.</summary>
+        public int CompiledValues => _compiledValueCount;
+
         /// <summary>Records one problem of the file.</summary>
         public void Error(YamlNode? node, string message)
         {
             var line = node?.Start.Line ?? 0;
             Errors.Add(line > 0 ? $"{_source}:{line}: {message}" : $"{_source}: {message}");
+        }
+
+        /// <summary>
+        /// The file is over one of its budgets: the load stops at once, without compiling the rest of
+        /// the file.
+        /// </summary>
+        void OverBudget(string what, int limit, int count) =>
+            throw new FilterBudgetException(
+                $"{_source}: the file holds more than {limit} {what} (the budget of {what} is {limit}, the file has {count})");
+
+        /// <summary>Counts one condition of the file and refuses it when the budget is over.</summary>
+        void CountCondition()
+        {
+            if (++_conditionCount > MaxConditions)
+                OverBudget("conditions", MaxConditions, _conditionCount);
+        }
+
+        /// <summary>Counts one value the file compiles and refuses it when the budget is over.</summary>
+        void CountValue()
+        {
+            if (++_compiledValueCount > MaxCompiledValues)
+                OverBudget("compiled values", MaxCompiledValues, _compiledValueCount);
         }
 
         /// <summary>Reads one document of the file (a file may hold several).</summary>
@@ -293,8 +459,7 @@ public static class FilterLoader
             }
             if (++_ruleCount > MaxRules)
             {
-                Error(node, $"the file holds more than {MaxRules} rules");
-                return;
+                OverBudget("rules", MaxRules, _ruleCount);
             }
 
             // The name is read first: every other message of the rule names it.
@@ -499,6 +664,7 @@ public static class FilterLoader
             var values = new List<string>();
             foreach (var child in sequence.Children)
             {
+                CountValue();
                 if (!TryScalar(child, out var text, out var kind) || kind != ScalarKind.String)
                 {
                     Error(child, $"{where}: the items of '{what}' must be texts");
@@ -530,6 +696,7 @@ public static class FilterLoader
             var values = new List<int>();
             foreach (var child in sequence.Children)
             {
+                CountValue();
                 if (!TryScalar(child, out var text, out var kind) || kind == ScalarKind.Null)
                 {
                     Error(child, $"{where}: the items of 'portnums' must be portnum names or numbers");
@@ -540,6 +707,13 @@ public static class FilterLoader
                     if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var number))
                     {
                         Error(child, $"{where}: '{text}' is not a portnum of the firmware");
+                        return null;
+                    }
+                    // A number outside the range of the protobufs is not a portnum.
+                    if (!FilterSchema.IsPortNumNumber(number))
+                    {
+                        Error(child, $"{where}: '{number}' is not a portnum of the firmware "
+                            + $"(the portnums are 0 to {FilterSchema.MaxPortNum})");
                         return null;
                     }
                     values.Add(number);
@@ -592,6 +766,7 @@ public static class FilterLoader
             var conditions = new List<FilterCondition>();
             foreach (var child in sequence.Children)
             {
+                CountCondition();
                 var condition = ReadCondition(where, child);
                 if (condition is not null)
                     conditions.Add(condition);
@@ -672,6 +847,13 @@ public static class FilterLoader
                     Error(node, $"{where}: '{portnumText}' is not a portnum of the firmware");
                     return null;
                 }
+                // A number outside the range of the protobufs is not a portnum.
+                if (!FilterSchema.IsPortNumNumber(number))
+                {
+                    Error(node, $"{where}: '{portnumText}' is not a portnum of the firmware "
+                        + $"(the portnums are 0 to {FilterSchema.MaxPortNum})");
+                    return null;
+                }
                 portnum = number;
             }
 
@@ -705,86 +887,8 @@ public static class FilterLoader
             };
         }
 
-        /// <summary>
-        /// Builds the path of a field and checks it against the protobuf it belongs to.
-        /// </summary>
-        static bool TryBuildPath(string field, int? portnum, out FieldPath path, out bool needsOpening, out string error)
-        {
-            path = new FieldPath();
-            needsOpening = false;
-            error = string.Empty;
-
-            MessageDescriptor root;
-            var rest = field;
-            if (field.StartsWith("packet.", StringComparison.Ordinal))
-            {
-                root = MeshPacket.Descriptor;
-                rest = field["packet.".Length..];
-            }
-            else if (field.StartsWith("data.", StringComparison.Ordinal))
-            {
-                root = Protobufs.Data.Descriptor;
-                rest = field["data.".Length..];
-                needsOpening = true;
-            }
-            else if (field.StartsWith("payload.", StringComparison.Ordinal))
-            {
-                needsOpening = true;
-                rest = field["payload.".Length..];
-                if (portnum is null)
-                {
-                    error = "a payload condition needs a portnum (the payload is decoded as the message "
-                        + "of its portnum)";
-                    return false;
-                }
-                if (portnum == FilterSchema.TextMessageApp)
-                {
-                    if (rest != "text")
-                    {
-                        error = "the payload of a TEXT_MESSAGE_APP is text: the only field of it is 'text'";
-                        return false;
-                    }
-                    path.Prefix = "payload";
-                    path.IsText = true;
-                    path.Kind = CompiledValueKind.String;
-                    return true;
-                }
-                if (!FilterSchema.PayloadMessages.TryGetValue(portnum.Value, out var descriptor))
-                {
-                    error = $"the portnum '{FilterSchema.PortNumName(portnum.Value)}' has no payload the filter "
-                        + $"can decode (the decoded ones are {string.Join(", ", FilterSchema.PayloadPortnumNames)})";
-                    return false;
-                }
-                root = descriptor;
-            }
-            else
-            {
-                error = $"the field must start with one of {string.Join(", ", FilterSchema.FieldPrefixes)}";
-                return false;
-            }
-
-            var parts = rest.Split('.');
-            if (!TryWalkFields(root, parts, out var fields, out error))
-                return false;
-
-            path.Prefix = field[..field.IndexOf('.')];
-            path.Fields = fields;
-            path.Kind = KindOf(fields[^1]);
-            path.Leaf = fields[^1];
-            return true;
-        }
-
-        /// <summary>The kind of the value a field holds.</summary>
-        static CompiledValueKind KindOf(FieldDescriptor field) => field.FieldType switch
-        {
-            FieldType.Bool => CompiledValueKind.Bool,
-            FieldType.String => CompiledValueKind.String,
-            FieldType.Enum => CompiledValueKind.Enum,
-            _ => CompiledValueKind.Number,
-        };
-
         /// <summary>Reads the value (or the values) of a condition and checks its type.</summary>
-        static bool TryCompileValues(FilterOp op, FieldPath path, YamlNode node, out CompiledValue[] values, out string error)
+        bool TryCompileValues(FilterOp op, FieldPath path, YamlNode node, out CompiledValue[] values, out string error)
         {
             values = [];
             switch (op)
@@ -824,13 +928,13 @@ public static class FilterLoader
                 var list = new List<CompiledValue>();
                 foreach (var child in sequence.Children)
                 {
+                    CountValue();
                     if (!TryCompileValue(path, child, out var value, out error))
                         return false;
                     list.Add(value);
                 }
                 values = list.ToArray();
-                error = string.Empty;
-                return true;
+                return CheckPortnumValues(op, path, values, out error);
             }
 
             if (node is YamlSequenceNode)
@@ -841,11 +945,32 @@ public static class FilterLoader
             if (!TryCompileValue(path, node, out var single, out error))
                 return false;
             values = [single];
+            return CheckPortnumValues(op, path, values, out error);
+        }
+
+        /// <summary>
+        /// Checks the values that are compared with the portnum of the packet: a number outside the
+        /// range of the protobufs is not a portnum.
+        /// </summary>
+        bool CheckPortnumValues(FilterOp op, FieldPath path, CompiledValue[] values, out string error)
+        {
+            error = string.Empty;
+            if (op is not (FilterOp.Eq or FilterOp.Ne or FilterOp.In) || !IsPortNumField(path))
+                return true;
+            foreach (var value in values)
+            {
+                if (value.IsInteger && !IsPortNumValue(value.Integer))
+                {
+                    error = $"'{value.Integer}' is not a portnum of the firmware "
+                        + $"(the portnums are 0 to {FilterSchema.MaxPortNum})";
+                    return false;
+                }
+            }
             return true;
         }
 
         /// <summary>Reads one value of a condition and checks it against the type of its field.</summary>
-        static bool TryCompileValue(FieldPath path, YamlNode node, out CompiledValue value, out string error)
+        bool TryCompileValue(FieldPath path, YamlNode node, out CompiledValue value, out string error)
         {
             value = default;
             if (!TryScalar(node, out var text, out var kind))
@@ -885,12 +1010,12 @@ public static class FilterLoader
                 {
                     if (kind == ScalarKind.Integer)
                     {
-                        if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var number))
+                        if (!TryWholeNumber(text, out var number))
                         {
                             error = $"'{text}' is not a value of the enum";
                             return false;
                         }
-                        value = CompiledValue.ForNumber(number, true, number);
+                        value = CompiledValue.ForNumber((double)number, true, number);
                         error = string.Empty;
                         return true;
                     }
@@ -914,15 +1039,20 @@ public static class FilterLoader
                 default:
                     if (kind == ScalarKind.Integer)
                     {
-                        var number = long.Parse(text, CultureInfo.InvariantCulture);
-                        value = CompiledValue.ForNumber(number, true, number);
+                        if (!TryWholeNumber(text, out var number))
+                        {
+                            error = $"'{text}' is out of range (a whole number is between "
+                                + $"{long.MinValue} and {ulong.MaxValue})";
+                            return false;
+                        }
+                        value = CompiledValue.ForNumber((double)number, true, number);
                         error = string.Empty;
                         return true;
                     }
                     if (kind == ScalarKind.Number)
                     {
                         var number = double.Parse(text, CultureInfo.InvariantCulture);
-                        value = CompiledValue.ForNumber(number, false, (long)number);
+                        value = CompiledValue.ForNumber(number, false, 0);
                         error = string.Empty;
                         return true;
                     }
@@ -930,6 +1060,14 @@ public static class FilterLoader
                     return false;
             }
         }
+
+        /// <summary>Whether the field is the portnum of the decoded data.</summary>
+        static bool IsPortNumField(FieldPath path) =>
+            path.Prefix == "data" && path.Leaf is not null && path.Leaf.Name == "portnum";
+
+        /// <summary>Whether the number is a portnum of the firmware.</summary>
+        static bool IsPortNumValue(Int128 number) =>
+            number >= 0 && number <= FilterSchema.MaxPortNum;
 
         /// <summary>Compiles the pattern of a regular expression.</summary>
         static bool TryCompileRegex(string pattern, out Regex? regex, out string error)
@@ -1046,7 +1184,9 @@ public static class FilterLoader
             kind = ScalarKind.Bool;
             return true;
         }
-        if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+        // A whole number is a sign and digits: it is not a number with a fraction, and it is not a
+        // number too big for a long, which is a load error and not a floating point value.
+        if (IsWholeNumber(text))
         {
             kind = ScalarKind.Integer;
             return true;
@@ -1058,6 +1198,43 @@ public static class FilterLoader
         }
         kind = ScalarKind.String;
         return true;
+    }
+
+    /// <summary>Whether the text is a whole number: a sign and digits, and nothing else.</summary>
+    static bool IsWholeNumber(string text)
+    {
+        var start = 0;
+        if (text.Length > 0 && (text[0] == '-' || text[0] == '+'))
+            start = 1;
+        if (start >= text.Length)
+            return false;
+        for (var i = start; i < text.Length; i++)
+        {
+            if (text[i] is < '0' or > '9')
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Reads a whole number of the file as an exact integer. A whole number that does not fit in the
+    /// range of the file (between <see cref="long.MinValue"/> and <see cref="ulong.MaxValue"/>) is not
+    /// a value the filter can compare with.
+    /// </summary>
+    static bool TryWholeNumber(string text, out Int128 number)
+    {
+        if (long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var signed))
+        {
+            number = signed;
+            return true;
+        }
+        if (ulong.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var unsigned))
+        {
+            number = unsigned;
+            return true;
+        }
+        number = 0;
+        return false;
     }
 
     /// <summary>How a kind of scalar is written in an error.</summary>
