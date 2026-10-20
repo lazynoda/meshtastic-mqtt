@@ -25,7 +25,11 @@ Without the section the broker has no filters: every packet that passes the othe
 The file itself is optional too: an empty file is no rules.
 
 [`filters.example.yaml`](../filters.example.yaml) is a working file with every key written out and
-commented.
+commented. It is an **illustration of every feature, not a starting point**: copied as it is, it drops
+every text message of every user and every packet the broker cannot open (the channels whose key it
+does not have and every direct message in PKI), and it stops the packets of the public channels that
+are not in its lists. The quick start of [Operations](operations.md#running-with-docker) starts with
+an empty file instead: an empty file means no rules.
 
 ## The three scopes
 
@@ -102,7 +106,9 @@ The portnum of the packet: the name the firmware writes (`TEXT_MESSAGE_APP`) or 
 - `allow`: the portnum of the packet has to be in the list.
 - `deny`: the portnum of the packet must not be in the list.
 
-A name that is not a portnum of the firmware is a load error.
+A name that is not a portnum of the firmware is a load error, and so is a number outside the range of
+the firmware (0 to 511). A number inside the range is accepted even when the firmware has no name for
+it.
 
 ### drop_if
 
@@ -139,6 +145,11 @@ of a boolean field `true` or `false`, and the value of an enum field the name of
 or its number.
 
 An enum is compared by its name (`TEXT_MESSAGE_APP`) or by its number (`67`).
+
+The numbers are compared **exactly**, whatever their size: a 64-bit unsigned field with the high bit
+put (`payload.host_metrics.freemem_bytes`, a `uint64`) is compared with the value of the rule as it
+is, and the comparison never fails with an overflow. A whole number of the file is between
+-9223372036854775808 and 18446744073709551615; a value outside that range is a load error.
 
 A **field that is not there** makes the condition false, with one exception: `ne` is then **true**. A
 field that is not there is a message field that is not set, a field of a `oneof` that is not the one of
@@ -253,9 +264,17 @@ A filtered packet is a drop:
 
 ## The hot reload
 
-The file is checked every `reload_check_seconds` seconds (the default is 5). The check compares the
-size, the time and the hash of the content of the file, so it works with a bind mount and with a file
-that is replaced atomically. A `SIGHUP` reloads it at once.
+The file is checked every `reload_check_seconds` seconds (the default is 5). The check looks at the
+size and the time of the file, and it reads and hashes the content only when one of them changed, and
+at least once a minute, so a file that is edited with the same size and the same time is still seen.
+The hash of the content is what makes the check work with a bind mount and with a file that is
+replaced atomically.
+
+A `SIGHUP` reloads it at once, and it always reads the content of the file: an edit that keeps its
+size and its time is applied at once too.
+
+Only one check runs at a time: the timer and the `SIGHUP` of the operator may ask for a reload at the
+same moment, and the file is read once and the reload line is written once.
 
 **The file has to be mounted through its directory, not as a single file.** A bind mount of one file
 keeps the inode it had when the mount was made, so a file that is replaced atomically on the host is
@@ -294,11 +313,12 @@ the old rules or the new ones, never a mix.
 - A valid file: one Information line,
 
   ```
-  Filters reloaded: 12 rules (3 user, 5 gateway, 4 node scopes), sha256 1a2b3c4d
+  Filters reloaded: 12 rules (3 user, 5 gateway, 4 node rules), sha256 1a2b3c4d
   ```
 
   The three numbers are the rules of each kind (they add up to the total) and the hash is the first
-  eight hex digits of the SHA-256 of the file.
+  eight hex digits of the SHA-256 of the file. One rule is written "1 rule" and more than one is
+  written "2 rules".
 
 - A file that cannot be read or is not valid: the rules that are in force stay in force, and one
   Warning is written with every problem of the file and the line it is on:
@@ -319,12 +339,29 @@ The file may not grow without bound:
 | Bound | The limit |
 |---|---|
 | the rules of the file | 10000 |
+| the conditions of the file | 100000 |
+| the values the file compiles | 1000000 |
+| the size of the file | 1 MiB (1048576 bytes) |
 | the items of a list | 1000 |
 | the characters of a text value | 512 |
 | the characters of the pattern of a regular expression | 512 |
 | the characters of the name of a rule | 64 |
 
-A file that is bigger is a load error, with the line of the problem.
+The values the file compiles are the items of the lists of `channels`, `topics` and `portnums` and the
+values of the operator `in`, summed over every rule of the file.
+
+The bounds are counted **after the aliases of the YAML are expanded**, so an alias that multiplies the
+rules, the conditions or the values of the file does not escape them: a small file that holds a
+million values through its aliases is a load error too. The file is checked while it is compiled and
+the load stops at the first bound it goes over, so a file that is over a budget never reaches the
+memory it would need.
+
+A file that is bigger is a load error, and the message names the bound, its limit and the count the
+file reached:
+
+```
+filters.yaml: the file holds more than 1000000 compiled values (the budget of compiled values is 1000000, the file has 1000001)
+```
 
 The evaluation itself is cheap: when no rule applies to a packet, nothing is read and nothing is
 allocated. The payload of a packet is decoded **at most once**, and only when a rule that applies needs

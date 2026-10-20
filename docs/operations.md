@@ -10,7 +10,7 @@ Building, running, upgrading and hardening the broker.
 docker build -t meshtastic-mqtt .
 cp config.example.yaml config.yaml   # edit it; config.yaml is git-ignored
 mkdir -p filters                    # the rules file lives here (see "Blocking a node")
-cp filters.example.yaml filters/filters.yaml
+: > filters/filters.yaml            # an empty file means no rules
 docker run -d --name meshtastic-mqtt \
   -p 1883:1883 \
   -v "$PWD/config.yaml:/config/config.yaml:ro" \
@@ -32,6 +32,10 @@ docker logs -f meshtastic-mqtt
 - The rules file of the [packet filters](filters.md) is mounted **through its directory**, and the
   broker only reads it, so the read-only mount is fine. The rules are changed on the host (see
   [Blocking a node](#blocking-a-node-while-the-broker-runs)).
+- The rules file starts **empty**, and an empty file means no rules: every packet that passes the
+  other checks is forwarded. [`filters.example.yaml`](../filters.example.yaml) is an illustration of
+  every feature of the rules file, **not a starting point**: copied as it is, it drops every text
+  message and every packet the broker cannot open. Copy the rules you need, not the example.
 
 The image needs one thing: a config file. There is no other secret in it, and nothing is baked into the
 image.

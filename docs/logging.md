@@ -42,7 +42,8 @@ every limit at its default; the exempt ranges are empty, so they read as `[]`):
 Listening on 0.0.0.0:1883 (plain MQTT). 1 user(s), 3 channel key(s), drop_pki=True, filters=off, limits: max_packet_size=4096, communication_timeout_seconds=10, auth_queue_timeout_seconds=3, auth_max_pending=64, auth_max_pending_per_user=4, max_connections_per_ip=16, connect_rate_per_ip_per_minute=30, connect_burst_per_ip=10, max_payload_size=512, publish_rate_per_client_per_minute=120, publish_burst_per_client=60, dedupe_window_seconds=120, dedupe_max_gateways_per_packet=32, dedupe_max_entries=200000, packet_rate_per_from_per_minute=30, packet_burst_per_from=15, auth_fail_max_per_ip=10, auth_fail_window_seconds=600, auth_ban_seconds=3600, auth_ban_exempt=[], max_tracked_entries=100000, rate_idle_expiry_seconds=600
 ```
 
-With a rules file, the line says `filters=on (12 rules)` instead of `filters=off`.
+With a rules file, the line says `filters=on (12 rules)` instead of `filters=off` (one rule is
+written `filters=on (1 rule)`).
 
 The limits are attached to the line as the structured property `LimitValues`, a JSON object whose keys
 keep the order of the text, so a log store keeps the limits of that run as data and not only as text. The
@@ -177,11 +178,12 @@ matched. See [Filters](filters.md).
 When the rules file changes and the new rules are valid, one Information line says so:
 
 ```
-Filters reloaded: 12 rules (3 user, 5 gateway, 4 node scopes), sha256 1a2b3c4d
+Filters reloaded: 12 rules (3 user, 5 gateway, 4 node rules), sha256 1a2b3c4d
 ```
 
 The three numbers are the rules of each kind (they add up to the total) and the hash is the first eight
-hex digits of the SHA-256 of the file.
+hex digits of the SHA-256 of the file. One rule is written "1 rule" and more than one is written
+"2 rules".
 
 When the file is not valid, the rules that are in force stay in force and one Warning says what is
 wrong, with the line of every problem:
