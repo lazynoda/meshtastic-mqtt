@@ -18,8 +18,10 @@ namespace Meshtastic.Mqtt;
 /// username and IP. The in-broker ban (see <see cref="AuthBanManager"/>) counts the failures itself, so
 /// the Warnings are for the operators. A refused SUBSCRIBE is one Warning per packet. Dropped publishes
 /// are Debug per packet, plus an Information summary per drop reason every 60 s (see
-/// <see cref="DropCounters"/>). The ban of an address is one Warning when it starts; the connections of
-/// a banned address are Debug.
+/// <see cref="DropCounters"/>). A packet the broker cannot open and forwards unchanged (the policy of the
+/// user that published it, <c>users[].forward_unopened</c>) is not a refusal: it is one Debug line per
+/// packet and it is not counted in the summary. The ban of an address is one Warning when it starts; the
+/// connections of a banned address are Debug.
 /// </remarks>
 public sealed class BrokerHooks
 {
@@ -51,6 +53,10 @@ public sealed class BrokerHooks
     readonly PacketInspector _inspector;
     readonly Dictionary<string, IReadOnlyCollection<string>> _subscribeAllow = new(StringComparer.Ordinal);
     readonly Dictionary<string, IReadOnlyCollection<string>> _publishAllow = new(StringComparer.Ordinal);
+
+    // Per user: whether the packets the broker cannot open are forwarded unchanged (users[].forward_unopened).
+    // The key is the user that owns the session, the same identity the publish ACL uses.
+    readonly Dictionary<string, bool> _forwardUnopened = new(StringComparer.Ordinal);
 
     // The limits of this phase: the payload cap, the per-client publish rate and the per-packet gate
     // (cross-gateway dedupe and per-node packet rate).
@@ -125,6 +131,7 @@ public sealed class BrokerHooks
         {
             _subscribeAllow[user.Username] = (user.SubscribeAllow ?? []).ToArray();
             _publishAllow[user.Username] = (user.PublishAllow ?? []).ToArray();
+            _forwardUnopened[user.Username] = user.ForwardUnopened;
         }
     }
 
@@ -585,7 +592,18 @@ public sealed class BrokerHooks
 
             var result = _inspector.Inspect(topic, payload);
 
-            if (!result.Accepted)
+            if (result.Unopened)
+            {
+                // The broker could not open the packet. It is not a refusal of the topic: the policy of the
+                // user that published it decides (users[].forward_unopened). A dropped copy is dropped here,
+                // before the packet gate, so it spends no dedupe entry and no budget of the node.
+                if (!ForwardsUnopened(owner))
+                {
+                    DropPublish(args, null, result.Reason, topic, owner, result);
+                    return Task.CompletedTask;
+                }
+            }
+            else if (!result.Accepted)
             {
                 DropPublish(args, null, result.Reason, topic, owner, result);
                 return Task.CompletedTask;
@@ -608,12 +626,22 @@ public sealed class BrokerHooks
             // filling the retained-message store with one entry per topic they invent.
             message!.Retain = false;
             args.ProcessPublish = true;
-            _log.Debug("Accepted publish on {Topic} from {ClientId}: {Reason} (from {From}, id {PacketId}, portnum {Portnum})",
-                Trim(topic), Trim(args.ClientId), result.Reason, NodeId(result.From), result.PacketId, result.Portnum);
-            if (result.ChannelHashMatches == false)
+            if (result.Unopened)
             {
-                _log.Debug("Channel hash mismatch on {Topic}: packet hash differs from the configured key for {Channel}",
-                    Trim(topic), result.Channel);
+                // The packet is forwarded unchanged: it is not a refusal, so it is not counted in the 60 s
+                // summary. One Debug line per packet: the channel, the from, the id and why it was not opened.
+                _log.Debug("Forwarded an unopened packet on {Topic} from {ClientId}: {Why:l} (channel {Channel}, from {From}, id {PacketId})",
+                    Trim(topic), Trim(args.ClientId), result.UnopenedWhy, result.Channel, NodeId(result.From), result.PacketId);
+            }
+            else
+            {
+                _log.Debug("Accepted publish on {Topic} from {ClientId}: {Reason} (from {From}, id {PacketId}, portnum {Portnum})",
+                    Trim(topic), Trim(args.ClientId), result.Reason, NodeId(result.From), result.PacketId, result.Portnum);
+                if (result.ChannelHashMatches == false)
+                {
+                    _log.Debug("Channel hash mismatch on {Topic}: packet hash differs from the configured key for {Channel}",
+                        Trim(topic), result.Channel);
+                }
             }
         }
         catch (Exception ex)
@@ -645,6 +673,14 @@ public sealed class BrokerHooks
     }
 
     static string NodeId(uint node) => $"!{node:x8}";
+
+    /// <summary>
+    /// Whether the user that owns the session forwards the packets the broker cannot open
+    /// (<c>users[].forward_unopened</c>). The owner is the identity the publish ACL uses, never
+    /// <c>args.UserName</c>.
+    /// </summary>
+    bool ForwardsUnopened(string? owner) =>
+        owner is not null && _forwardUnopened.TryGetValue(owner, out var forward) && forward;
 
     /// <summary>Drop reasons of the publish ACL, as counted in <see cref="Drops"/>.</summary>
     internal const string InvalidTopicNameReason = "invalid topic name";

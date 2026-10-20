@@ -21,8 +21,8 @@ internal static class StartupLine
         // explicitly.
         var limitValues = OrderedProperties.Object(limits.EffectiveValues());
         log.ForContext(OrderedProperties.Enricher("LimitValues", limitValues))
-            .Information("Listening on {Address:l}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_undecryptable={DropUndecryptable}, drop_pki={DropPki}, limits: {Limits:l}",
+            .Information("Listening on {Address:l}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_pki={DropPki}, limits: {Limits:l}",
                 config.BindAddress, config.Listener.Port, config.Users!.Count, config.ChannelKeyMap.Count,
-                config.DropUndecryptable, config.DropPki, limits.Describe());
+                config.DropPki, limits.Describe());
     }
 }

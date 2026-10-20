@@ -10,7 +10,8 @@ file is invalid:
 
 - an unknown key is an error, not something that is ignored: a typo stops the broker;
 - a key written twice is an error (the YAML parser rejects it);
-- an empty value for `drop_undecryptable` or `drop_pki` is an error: write `true` or `false`;
+- an empty value for `drop_pki` or for a user's `forward_unopened` is an error: write `true` or `false`;
+- a key that was removed is an error that says where it went (see below);
 - an empty PSK is an error: write the base64 key (`"AA=="` means no encryption);
 - a value outside its range is an error, and the message names the key and the range;
 - an invalid topic filter, a duplicate username, an invalid CIDR range or a `max_payload_size` larger than
@@ -31,12 +32,19 @@ written out and commented.
 | Key | Type | Default | Range | What it does | When to change it |
 |---|---|---|---|---|---|
 | `log_level` | string | `information` | `verbose`, `debug`, `information`, `warning`, `error`, `fatal` (the case does not matter) | The lowest level that is written. | `debug` while you look for a node that does not appear; `warning` on a host where the log is read by a machine. See [Logging](logging.md). |
-| `drop_undecryptable` | bool | `true` | `true` or `false` | Drop the channel packets that do not decrypt with the key configured for their channel (a private channel, a wrong key, garbage). | `false` only when you must see the packets of a channel whose key you do not have: they are then forwarded undecrypted. See [Packet filtering](packet-filtering.md#drop_undecryptable-and-drop_pki). |
-| `drop_pki` | bool | `true` | `true` or `false` | Drop the PKI-encrypted direct messages, which the broker can never decrypt. | `false` when a downlink gateway must deliver the direct messages across MQTT. See [Packet filtering](packet-filtering.md#drop_undecryptable-and-drop_pki). |
+| `drop_pki` | bool | `true` | `true` or `false` | Drop the PKI-encrypted direct messages, which the broker can never decrypt. | `false` when a downlink gateway must deliver the direct messages across MQTT. See [Packet filtering](packet-filtering.md#drop_pki). |
 | `default_psk` | string (base64) | `AQ==` | a base64 PSK of at most 32 bytes; an empty value is an error | The key of every channel that is not listed under `channels`. `AQ==` is the firmware default key. | When a channel is not listed under `channels` and does not use the firmware default key. |
 | `channels` | map of name to base64 PSK | empty | names: not empty, not only whitespace, and no `/`, `+` or `#`; values: a non-empty base64 PSK of at most 32 bytes | The keys of the channels, by their exact name. The lookup is case-sensitive, like the firmware's channel hash. | When a channel of the mesh uses a key other than `default_psk`. See [Channel keys](packet-filtering.md#channel-keys). |
 | `users` | list of objects | at least one user is required | - | The users the broker accepts, and their ACLs. | When a user is added or removed, or when its ACLs change. |
 | `limits` | map of int (and one list) | the defaults of the tables below | see the tables below | The limits of the broker: the packet sizes, the rates, the bans and the caps of the tables. | See [Limits and dedupe](limits-and-dedupe.md). |
+
+The global `drop_undecryptable` is **removed**: it moved to `users[].forward_unopened`, with the
+inverted meaning. A config that still has it does not start: the error says so.
+
+```
+Invalid config '/config/config.yaml':
+drop_undecryptable: removed; it moved to users[].forward_unopened, with the inverted meaning: forward_unopened: true (the default) forwards the packets the broker cannot open, and false drops them
+```
 
 ## The channel keys
 
@@ -68,9 +76,11 @@ Each entry of the `users` list is one user the broker accepts.
 | `users[].password_hash` | string | required | `pbkdf2-sha256$<iterations>$<salt>$<hash>`, with 100000-10000000 iterations, a salt of at least 16 bytes and a hash of exactly 32 bytes, all base64 | The hash of the password of the user. The plain password is never in the file. | When the password changes. See [Password hashes](security.md#password-hashes). |
 | `users[].subscribe_allow` | list of topic filters | empty | valid MQTT topic filters | The filters the user may subscribe to. An empty or missing list denies every subscription. | When a dashboard or a gateway needs to read. See [The ACLs](security.md#the-acls). |
 | `users[].publish_allow` | list of topic filters | empty | valid MQTT topic filters | The filters a PUBLISH topic of the user must match. An empty or missing list denies every publish. | When a user must uplink. See [The ACLs](security.md#the-acls). |
+| `users[].forward_unopened` | bool | `true` | `true` or `false` | What the broker does with a channel packet of this user it cannot open (a channel whose key it does not have, a wrong key): `true` forwards the packet unchanged, `false` drops it. | `false` when the user must not put traffic of channels the broker cannot read on the wire. See [The packets the broker cannot open](packet-filtering.md#the-packets-the-broker-cannot-open). |
 
 An invalid filter (`#` that is not the last level, a `+` or a `#` inside a level, an empty filter) stops the
-broker at startup, with the name of the user and the filter in the message.
+broker at startup, with the name of the user and the filter in the message. An empty
+`forward_unopened` stops it too: write `true` or `false`, or leave the key out to use the default.
 
 ## The limits
 

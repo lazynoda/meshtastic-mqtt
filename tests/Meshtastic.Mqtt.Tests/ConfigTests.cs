@@ -21,7 +21,7 @@ public class ConfigTests
         var c = ConfigLoader.Parse(Minimal());
         Assert.Equal(1883, c.Listener.Port);
         Assert.Equal(IPAddress.Any, c.BindAddress);
-        Assert.True(c.DropUndecryptable);
+        Assert.True(c.Users![0].ForwardUnopened);
         Assert.True(c.DropPki);
         Assert.Equal("AQ==", c.DefaultPsk);
         Assert.Empty(c.Users![0].SubscribeAllow!);
@@ -90,7 +90,7 @@ public class ConfigTests
         Assert.Empty(meshdev.SubscribeAllow!);
         Assert.Equal(["msh/EU_868/2/e/#", "msh/EU_868/2/map/"], meshdev.PublishAllow!);
         Assert.True(meshdev.ParsedHash!.Verify("large4cats"u8));
-        Assert.True(c.DropUndecryptable);
+        Assert.True(meshdev.ForwardUnopened);
         Assert.True(c.DropPki);
 
         ChannelKeys.TryExpand("AQ==", out var aq, out _);
@@ -135,8 +135,6 @@ public class ConfigTests
     }
 
     [Theory]
-    [InlineData("drop_undecryptable:", "drop_undecryptable")]
-    [InlineData("drop_undecryptable: ~", "drop_undecryptable")]
     [InlineData("drop_pki:", "drop_pki")]
     [InlineData("drop_pki: null", "drop_pki")]
     public void NullBoolean_IsRejected(string extra, string mentions)
@@ -147,14 +145,50 @@ public class ConfigTests
         Assert.Contains("true or false", ex.Message);
     }
 
+    [Theory]
+    [InlineData("    forward_unopened:\n")]
+    [InlineData("    forward_unopened: ~\n")]
+    [InlineData("    forward_unopened: null\n")]
+    public void T5_AnEmptyForwardUnopened_IsRejected(string line)
+    {
+        // An empty value must not silently turn the filter off: the packets the broker cannot open are
+        // forwarded by default, and only an explicit false drops them.
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse($"users:\n  - username: a\n    password_hash: \"{Hash}\"\n{line}"));
+        Assert.Contains("forward_unopened", ex.Message);
+        Assert.Contains("true or false", ex.Message);
+    }
+
+    [Fact]
+    public void T5_ForwardUnopened_DefaultsToTrue_AndCanBeTurnedOff()
+    {
+        var c = ConfigLoader.Parse(Minimal());
+        Assert.True(c.Users![0].ForwardUnopened);
+
+        var off = ConfigLoader.Parse(
+            $"users:\n  - username: meshdev\n    password_hash: \"{Hash}\"\n    forward_unopened: false\n");
+        Assert.False(off.Users![0].ForwardUnopened);
+    }
+
+    [Theory]
+    [InlineData("drop_undecryptable: true")]
+    [InlineData("drop_undecryptable: false")]
+    [InlineData("drop_undecryptable:")]
+    [InlineData("drop_undecryptable: ~")]
+    public void T5_TheRemovedDropUndecryptable_IsRejected_NamingTheNewKey(string extra)
+    {
+        // The global key is gone: it moved to users[].forward_unopened, with the inverted meaning.
+        var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));
+        Assert.Contains("forward_unopened", ex.Message);
+        Assert.Contains("removed", ex.Message);
+    }
+
     [Fact]
     public void AbsentBooleans_KeepTheirDefaults()
     {
         var c = ConfigLoader.Parse(Minimal());
-        Assert.True(c.DropUndecryptable);
+        Assert.True(c.Users![0].ForwardUnopened);
         Assert.True(c.DropPki);
-        var off = ConfigLoader.Parse(Minimal("drop_undecryptable: false\ndrop_pki: false"));
-        Assert.False(off.DropUndecryptable);
+        var off = ConfigLoader.Parse(Minimal("drop_pki: false"));
         Assert.False(off.DropPki);
     }
 
@@ -404,7 +438,7 @@ public class ConfigTests
     [InlineData("channels:\n  Test: '***'", "channels.Test")]
     [InlineData("channels:\n  'a/b': AQ==", "channel name")]
     [InlineData("listener:\n  prot: 1883", "prot")]                         // unknown key = typo, not ignored
-    [InlineData("drop_undecryptable: maybe", "maybe")]
+    [InlineData("drop_pki: maybe", "maybe")]
     public void InvalidValues_FailWithAClearMessage(string extra, string mentions)
     {
         var ex = Assert.Throws<ConfigException>(() => ConfigLoader.Parse(Minimal(extra)));

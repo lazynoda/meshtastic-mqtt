@@ -40,6 +40,9 @@ public sealed class BrokerIntegrationTests : IAsyncLifetime
               - username: meshdev
                 password_hash: "{AuthTests.MeshdevHash}"
                 publish_allow: [msh/ES/2/e/#]
+                # The tests of this class want the packets the broker cannot open to be dropped, as they
+                # were before users[].forward_unopened existed.
+                forward_unopened: false
               - username: alice
                 password_hash: "{AuthTests.AliceHash}"
                 subscribe_allow: [msh/ES/2/e/test/#, msh/ES/2/e/Test/#]

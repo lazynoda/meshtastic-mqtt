@@ -31,8 +31,21 @@ public sealed class DropCounters : IAsyncDisposable
     public void Increment(string reason)
     {
         // Collapse numbers ("size 300 outside 1-256" -> "size N outside N-N") so keys stay a small fixed set.
-        var key = Digits.Replace(reason, "N");
+        // A number between two slashes is part of the shape of a reason (the fixed "/2/" of the topic
+        // format) and not a value: it is kept, so the key stays readable.
+        var key = Digits.Replace(reason, m => Collapse(m, reason));
         _counts.AddOrUpdate(key, 1, (_, n) => n + 1);
+    }
+
+    /// <summary>
+    /// The key of a reason: the numbers are collapsed to <c>N</c>, except a number that is between two
+    /// slashes, which is kept (the whole run of digits, not one digit at a time).
+    /// </summary>
+    static string Collapse(System.Text.RegularExpressions.Match match, string reason)
+    {
+        var before = match.Index > 0 ? reason[match.Index - 1] : '\0';
+        var after = match.Index + match.Length < reason.Length ? reason[match.Index + match.Length] : '\0';
+        return before == '/' && after == '/' ? match.Value : "N";
     }
 
     /// <summary>The counts as they are now, without flushing them (for tests).</summary>
@@ -44,7 +57,8 @@ public sealed class DropCounters : IAsyncDisposable
         return copy;
     }
 
-    static readonly System.Text.RegularExpressions.Regex Digits = new("[0-9]+", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    // The whole run of digits, so a number of several digits is collapsed (or kept) as one piece.
+    static readonly System.Text.RegularExpressions.Regex Digits = new("(?<![0-9])[0-9]+(?![0-9])", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     /// <summary>Logs and resets the counters; logs nothing when nothing was dropped.</summary>
     public void Flush()

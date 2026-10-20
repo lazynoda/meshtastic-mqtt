@@ -82,4 +82,39 @@ public sealed class DropSummaryTests
         Assert.Equal(1, breakdown.GetProperty("banned IP").GetInt64());
         Assert.Equal(2, breakdown.GetProperty("not in publish_allow").GetInt64());
     }
+
+    // DF6: the numbers of a reason are collapsed, except the ones between two slashes: the fixed "/2/" of
+    // the topic format is part of the shape of the reason, not a value.
+
+    [Fact]
+    public void DF6_TheTopicReasons_KeepTheirSlashTwo_AndTheSizeReasonIsCollapsed()
+    {
+        var (drops, logs) = Counters();
+        drops.Increment("unsupported topic (expected <root>/2/e/<channel>/<gateway>)");
+        drops.Increment("unsupported map topic (expected <root>/2/map/)");
+        drops.Increment("encrypted payload size 300 outside 1-256");
+
+        drops.Flush();
+
+        var message = Assert.Single(logs.Events, e => e.Level == LogEventLevel.Information).RenderMessage();
+        Assert.Contains("unsupported topic (expected <root>/2/e/<channel>/<gateway>): 1", message);
+        Assert.Contains("unsupported map topic (expected <root>/2/map/): 1", message);
+        Assert.Contains("encrypted payload size N outside N-N: 1", message);
+        Assert.DoesNotContain("/N/", message);
+    }
+
+    [Fact]
+    public void DF6_AMultiDigitNumberBetweenTwoSlashes_IsKeptWhole()
+    {
+        // The whole run of digits is kept, not one digit at a time.
+        var (drops, logs) = Counters();
+        drops.Increment("a reason with /12/ in it");
+        drops.Increment("a reason with 12 in it");
+
+        drops.Flush();
+
+        var message = Assert.Single(logs.Events, e => e.Level == LogEventLevel.Information).RenderMessage();
+        Assert.Contains("a reason with /12/ in it: 1", message);
+        Assert.Contains("a reason with N in it: 1", message);
+    }
 }

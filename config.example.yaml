@@ -11,10 +11,6 @@ listener:
 # logs every accepted and dropped packet (topic, client, from, id, portnum; never the payload).
 log_level: information
 
-# Drop channel packets that do not decrypt with the key configured for their channel
-# (private channels, wrong keys, garbage).
-drop_undecryptable: true
-
 # Drop PKI-encrypted direct messages (topic <root>/2/e/PKI/<gateway>). The broker can never decrypt
 # them; set to false to pass them through opaquely so that downlink gateways can deliver DMs.
 drop_pki: true
@@ -126,9 +122,13 @@ users:
   #   msh/EU_868/2/e/#     encrypted channel packets, msh/EU_868/2/e/<channel>/<gateway>
   #   msh/EU_868/2/map/    map reports; the firmware publishes them to exactly this topic, trailing slash included
   #                        (MQTT.cpp: mapTopic = root + "/2/map/"), and the broker checks they really are MapReports.
+  # forward_unopened: what the broker does with a channel packet it cannot open (a channel whose key it does
+  # not have, a wrong key). true (the default) forwards the packet unchanged, so a subscriber sees the traffic
+  # of every channel; false drops it. Per user.
   # Generate a hash with: docker run --rm -i <image> hash-password
   - username: meshdev
     password_hash: "pbkdf2-sha256$600000$iqngz3pWU8HFZn8xIv8/IQ==$ZhdEPkHgqnG2zbHe26j6U598nTyFTA8J/Kzm7WCxDuA="
+    forward_unopened: true
     publish_allow:
       - "msh/EU_868/2/e/#"
       - "msh/EU_868/2/map/"

@@ -1,7 +1,9 @@
 using Google.Protobuf;
 using Meshtastic.Mqtt;
 using Meshtastic.Protobufs;
+using Serilog;
 using Xunit;
+using static Meshtastic.Mqtt.Tests.TestSupport;
 
 namespace Meshtastic.Mqtt.Tests;
 
@@ -13,8 +15,7 @@ public class PublishFilterTests
 {
     internal static byte[] Fixture(string name) => File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", name));
 
-    internal static BrokerConfig Config(bool dropUndecryptable = true, bool dropPki = true) => ConfigLoader.Parse($"""
-        drop_undecryptable: {dropUndecryptable.ToString().ToLowerInvariant()}
+    internal static BrokerConfig Config(bool forwardUnopened = true, bool dropPki = true) => ConfigLoader.Parse($"""
         drop_pki: {dropPki.ToString().ToLowerInvariant()}
         channels:
           Test: "Ag=="
@@ -23,10 +24,15 @@ public class PublishFilterTests
         users:
           - username: meshdev
             password_hash: "{AuthTests.AliceHash}"
+            publish_allow: ["msh/ES/2/e/#"]
+            forward_unopened: {forwardUnopened.ToString().ToLowerInvariant()}
         """);
 
     static Inspection Inspect(string topic, byte[] payload, BrokerConfig? config = null) =>
         new PacketInspector(config ?? Config()).Inspect(topic, payload);
+
+    static ILogger Logger() =>
+        new LoggerConfiguration().MinimumLevel.Verbose().WriteTo.Sink(new LogSink()).CreateLogger();
 
     [Theory]
     [InlineData("msh/ES/2/e/SFNarrow/!1a2b3c4d", "sfnarrow_aq.bin", "SFNarrow")]
@@ -74,11 +80,34 @@ public class PublishFilterTests
     }
 
     [Fact]
-    public void Undecryptable_PassesWhenConfigured()
+    public async Task Undecryptable_PassesWhenConfigured()
     {
-        var r = Inspect("msh/ES/2/e/Test/!1a2b3c4d", Fixture("test_wrong_key_aq.bin"), Config(dropUndecryptable: false));
-        Assert.True(r.Accepted);
+        // The inspector does not decide: it reports the packet as unopened, and the policy of the user that
+        // published it (users[].forward_unopened) decides whether it is forwarded or dropped.
+        var inspector = new PacketInspector(Config());
+        var r = inspector.Inspect("msh/ES/2/e/Test/!1a2b3c4d", Fixture("test_wrong_key_aq.bin"));
+        Assert.False(r.Accepted);
+        Assert.True(r.Unopened);
+        Assert.Equal(PacketInspector.UndecryptableReason, r.Reason);
+        Assert.Equal(PacketInspector.UnopenedByKeyReason, r.UnopenedWhy);
         Assert.Null(r.Portnum);
+
+        // The user forwards the packets the broker cannot open: the publish goes through.
+        var hooks = new BrokerHooks(Config(forwardUnopened: true), Logger());
+        var args = PublishArgs("msh/ES/2/e/Test/!1a2b3c4d", Fixture("test_wrong_key_aq.bin"), "meshdev", "meshdev");
+        await hooks.InterceptPublishAsync(args);
+        Assert.True(args.ProcessPublish);
+    }
+
+    [Fact]
+    public async Task Undecryptable_IsDroppedWhenTheUserDropsThosePackets()
+    {
+        // The other value of the key: the packet is dropped, with the reason of today.
+        var hooks = new BrokerHooks(Config(forwardUnopened: false), Logger());
+        var args = PublishArgs("msh/ES/2/e/Test/!1a2b3c4d", Fixture("test_wrong_key_aq.bin"), "meshdev", "meshdev");
+        await hooks.InterceptPublishAsync(args);
+        Assert.False(args.ProcessPublish);
+        Assert.Contains(PacketInspector.UndecryptableReason, hooks.Drops.Snapshot().Keys);
     }
 
     [Fact]
@@ -230,7 +259,7 @@ public class PublishFilterTests
     [Fact]
     public void RandomBytes_NeverThrow()
     {
-        var inspector = new PacketInspector(Config(dropUndecryptable: false, dropPki: false));
+        var inspector = new PacketInspector(Config(forwardUnopened: true, dropPki: false));
         var valid = Fixture("sfnarrow_aq.bin");
         var rng = new Random(1234);
         for (var i = 0; i < 20_000; i++)

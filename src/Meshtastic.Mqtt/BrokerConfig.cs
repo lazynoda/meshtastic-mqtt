@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using Serilog.Events;
 using YamlDotNet.Core;
+using YamlDotNet.RepresentationModel;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
 
@@ -13,16 +14,10 @@ public sealed class BrokerConfig
     public ListenerConfig Listener { get; set; } = new();
     public string LogLevel { get; set; } = "information";
 
-    // The two security flags are nullable on the YAML side only so that an empty value
+    // The security flag is nullable on the YAML side only so that an empty value
     // (`drop_pki:` or `drop_pki: ~`) is reported as an error instead of silently turning into false.
-    [YamlMember(Alias = "drop_undecryptable", ApplyNamingConventions = false)]
-    public bool? DropUndecryptableSetting { get; set; } = true;
-
     [YamlMember(Alias = "drop_pki", ApplyNamingConventions = false)]
     public bool? DropPkiSetting { get; set; } = true;
-
-    /// <summary>Drop channel packets the broker cannot decrypt with the key configured for their channel.</summary>
-    [YamlIgnore] public bool DropUndecryptable => DropUndecryptableSetting ?? true;
 
     /// <summary>Drop PKI-encrypted DMs (channel_id "PKI"). They can never be decrypted by the broker.</summary>
     [YamlIgnore] public bool DropPki => DropPkiSetting ?? true;
@@ -52,8 +47,6 @@ public sealed class BrokerConfig
         var errors = new List<string>();
         Listener ??= new ListenerConfig();
 
-        if (DropUndecryptableSetting is null)
-            errors.Add("drop_undecryptable: empty value; write true or false (leave the key out to use the default, true)");
         if (DropPkiSetting is null)
             errors.Add("drop_pki: empty value; write true or false (leave the key out to use the default, true)");
 
@@ -143,6 +136,11 @@ public sealed class BrokerConfig
                 if (!TopicFilter.IsValid(filter, out var filterError))
                     errors.Add($"{where}.publish_allow: {filterError}");
             }
+
+            // An empty value must not silently turn the filter off: the packets the broker cannot open are
+            // forwarded by default, and only an explicit false drops them.
+            if (user.ForwardUnopenedSetting is null)
+                errors.Add($"{where}.forward_unopened: empty value; write true or false (leave the key out to use the default, true)");
         }
         return errors;
     }
@@ -481,6 +479,20 @@ public sealed class UserConfig
     /// </summary>
     public List<string>? PublishAllow { get; set; } = new();
 
+    /// <summary>
+    /// Forward the channel packets the broker cannot open, unchanged. Nullable on the YAML side only so that
+    /// an empty value (<c>forward_unopened:</c> or <c>forward_unopened: ~</c>) is reported as an error
+    /// instead of silently turning into false.
+    /// </summary>
+    [YamlMember(Alias = "forward_unopened", ApplyNamingConventions = false)]
+    public bool? ForwardUnopenedSetting { get; set; } = true;
+
+    /// <summary>
+    /// Forward the packets the broker cannot open (a channel whose key it does not have, a wrong key): the
+    /// default. The other value drops them, as <c>drop_undecryptable</c> used to do.
+    /// </summary>
+    [YamlIgnore] public bool ForwardUnopened => ForwardUnopenedSetting ?? true;
+
     [YamlIgnore] public PasswordHash? ParsedHash { get; internal set; }
 }
 
@@ -489,6 +501,18 @@ public sealed class ConfigException(string message) : Exception(message);
 public static class ConfigLoader
 {
     public const string EnvironmentVariable = "MESHTASTIC_MQTT_CONFIG";
+
+    /// <summary>The global key that was removed: it moved to <c>users[].forward_unopened</c>.</summary>
+    public const string RemovedDropUndecryptableKey = "drop_undecryptable";
+
+    /// <summary>
+    /// What the loader says when the removed key is still in the file. The plain "unknown property" error of
+    /// the parser is not enough: the operator has to be told where the key went, and that its meaning is
+    /// inverted there.
+    /// </summary>
+    public const string RemovedDropUndecryptableError =
+        "drop_undecryptable: removed; it moved to users[].forward_unopened, with the inverted meaning: "
+        + "forward_unopened: true (the default) forwards the packets the broker cannot open, and false drops them";
 
     public static BrokerConfig LoadFile(string path)
     {
@@ -506,6 +530,10 @@ public static class ConfigLoader
 
     public static BrokerConfig Parse(string yaml)
     {
+        // The removed key is refused before the deserialization: the parser would only say "unknown property",
+        // and the operator has to be told where the key went.
+        RejectRemovedKey(yaml);
+
         var deserializer = new DeserializerBuilder()
             .WithNamingConvention(UnderscoredNamingConvention.Instance)
             .WithDuplicateKeyChecking()   // a repeated key (users:, a channel) must not silently replace the first
@@ -528,5 +556,34 @@ public static class ConfigLoader
         if (errors.Count > 0)
             throw new ConfigException(string.Join(Environment.NewLine, errors.Select(e => "- " + e)));
         return config;
+    }
+
+    /// <summary>
+    /// Refuses the removed global key with its own message. The document is looked at as a tree, so the key
+    /// is found whatever its value is (true, false, an empty value or a word).
+    /// </summary>
+    static void RejectRemovedKey(string yaml)
+    {
+        YamlStream stream;
+        try
+        {
+            stream = new YamlStream();
+            stream.Load(new StringReader(yaml));
+        }
+        catch (YamlException)
+        {
+            return;   // a broken document: the deserializer reports it, with its line and its column
+        }
+
+        foreach (var document in stream.Documents)
+        {
+            if (document.RootNode is not YamlMappingNode map)
+                continue;
+            foreach (var key in map.Children.Keys)
+            {
+                if (key is YamlScalarNode scalar && scalar.Value == RemovedDropUndecryptableKey)
+                    throw new ConfigException(RemovedDropUndecryptableError);
+            }
+        }
     }
 }

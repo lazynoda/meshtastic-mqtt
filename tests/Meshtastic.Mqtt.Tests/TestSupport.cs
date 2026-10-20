@@ -1,8 +1,10 @@
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using MQTTnet;
 using MQTTnet.Formatter;
+using MQTTnet.Server;
 using Serilog.Core;
 using Serilog.Events;
 using Xunit;
@@ -80,6 +82,19 @@ static class TestSupport
         while (!condition() && DateTime.UtcNow < deadline)
             await Task.Delay(50, TestContext.Current.CancellationToken);
         return condition();
+    }
+
+    /// <summary>
+    /// Just enough of a publish to call the publish hook directly. The owner is the user bound to the session
+    /// at connect time (the identity the ACLs use), and it is null when the session has no owner.
+    /// </summary>
+    public static InterceptingPublishEventArgs PublishArgs(string topic, byte[] payload, string userName, string? owner)
+    {
+        var items = new Hashtable();
+        if (owner is not null)
+            items[BrokerHooks.OwnerKey] = owner;
+        var message = new MqttApplicationMessageBuilder().WithTopic(topic).WithPayload(payload).Build();
+        return new InterceptingPublishEventArgs(message, "node-1", userName, items, CancellationToken.None);
     }
 
     public sealed class LogSink : ILogEventSink

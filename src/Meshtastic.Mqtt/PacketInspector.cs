@@ -13,7 +13,14 @@ public sealed record Inspection(
     PortNum? Portnum = null,
     bool? ChannelHashMatches = null,
     string? Gateway = null,
-    uint GatewayNode = 0);
+    uint GatewayNode = 0,
+    /// <summary>
+    /// The broker could not open the packet. It is not a refusal of the packet: the policy of the user that
+    /// published it decides (<c>users[].forward_unopened</c>), and the publish hook applies it.
+    /// </summary>
+    bool Unopened = false,
+    /// <summary>Why the packet was not opened: no key for its channel, or a key that does not open it.</summary>
+    string? UnopenedWhy = null);
 
 /// <summary>
 /// Decides whether a published message may reach subscribers. Pure logic on (topic, payload):
@@ -26,6 +33,18 @@ public sealed class PacketInspector(BrokerConfig config)
 
     /// <summary>8-byte AES-CCM tag + 4-byte extra nonce appended to every PKI packet.</summary>
     const int PkiOverhead = 12;
+
+    /// <summary>
+    /// The reason of a packet the broker could not open. It is the drop reason when the user that published
+    /// it drops those packets (<c>users[].forward_unopened: false</c>), and it is the key of the summary.
+    /// </summary>
+    public const string UndecryptableReason = "undecryptable with the key configured for this channel";
+
+    /// <summary>Why a packet was not opened: its channel is not listed under <c>channels</c>.</summary>
+    public const string UnopenedNoKeyReason = "no key is configured for this channel";
+
+    /// <summary>Why a packet was not opened: the key of its channel does not open it.</summary>
+    public const string UnopenedByKeyReason = "the key configured for this channel does not open it";
 
     public Inspection Inspect(string? topic, ReadOnlySpan<byte> payload)
     {
@@ -84,14 +103,28 @@ public sealed class PacketInspector(BrokerConfig config)
             return InspectPki(packet, topicGateway);
 
         var gatewayNode = GatewayNode(topicGateway);
-        var key = config.ChannelKeyMap.TryGetValue(channel, out var configured) ? configured : config.DefaultKey;
+        // The key of the channel: the one of its name, or the default key for a channel that is not listed.
+        byte[] key;
+        bool listed;
+        if (config.ChannelKeyMap.TryGetValue(channel, out var channelKey))
+        {
+            key = channelKey;
+            listed = true;
+        }
+        else
+        {
+            key = config.DefaultKey;
+            listed = false;
+        }
         var hashMatches = ChannelKeys.ChannelHash(channel, key) == packet.Channel;
         var data = TryDecrypt(packet, key);
         if (data is null)
         {
-            return config.DropUndecryptable
-                ? Drop("undecryptable with the key configured for this channel", channel, packet, hashMatches)
-                : new Inspection(true, "undecryptable, passed (drop_undecryptable: false)", channel, packet.From, packet.Id, null, hashMatches, topicGateway, gatewayNode);
+            // The broker could not open the packet. It does not drop it here: the policy of the user that
+            // published it decides (users[].forward_unopened), and the reason is the same either way.
+            var why = listed ? UnopenedByKeyReason : UnopenedNoKeyReason;
+            return new Inspection(false, UndecryptableReason, channel, packet.From, packet.Id, null, hashMatches,
+                topicGateway, gatewayNode, Unopened: true, UnopenedWhy: why);
         }
         return new Inspection(true, "decrypted", channel, packet.From, packet.Id, data.Portnum, hashMatches, topicGateway, gatewayNode);
     }
