@@ -16,16 +16,13 @@ internal static class StartupLine
     public static void Write(ILogger log, BrokerConfig config)
     {
         var limits = config.Limits!;
-        log.ForContext("LimitValues", LimitValues(limits), destructureObjects: true)
-            .Information("Listening on {Address}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_undecryptable={DropUndecryptable}, drop_pki={DropPki}, limits: {Limits:l}",
+        // The limits are attached as a JSON object whose keys keep the order of EffectiveValues(): the
+        // order of the enumeration of a plain dictionary is not guaranteed, so the value is built
+        // explicitly.
+        var limitValues = OrderedProperties.Object(limits.EffectiveValues());
+        log.ForContext(OrderedProperties.Enricher("LimitValues", limitValues))
+            .Information("Listening on {Address:l}:{Port} (plain MQTT). {Users} user(s), {Channels} channel key(s), drop_undecryptable={DropUndecryptable}, drop_pki={DropPki}, limits: {Limits:l}",
                 config.BindAddress, config.Listener.Port, config.Users!.Count, config.ChannelKeyMap.Count,
                 config.DropUndecryptable, config.DropPki, limits.Describe());
     }
-
-    /// <summary>
-    /// The limits as Serilog writes them: a plain dictionary, so the JSON log holds an object keyed by
-    /// the name of the limit. The ordered dictionary of <see cref="LimitsConfig.EffectiveValues"/> is
-    /// written as a list of pairs instead, which a log store cannot read as a dictionary.
-    /// </summary>
-    static Dictionary<string, object> LimitValues(LimitsConfig limits) => new(limits.EffectiveValues());
 }

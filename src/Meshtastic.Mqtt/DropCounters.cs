@@ -62,10 +62,11 @@ public sealed class DropCounters : IAsyncDisposable
         var breakdown = string.Join(", ", snapshot.Select(reason => $"{reason.Key}: {reason.Value}"));
         // The breakdown is written twice: as a literal in the message (so the line reads
         // "reason: count, ..." without quotes) and as a structured property (the counts per reason), so
-        // the log store keeps a breakdown it can filter by. Serilog writes a plain dictionary as a
-        // structure (a JSON object), so the counts are attached as one, in the order of the text.
-        var counts = new Dictionary<string, long>(snapshot, StringComparer.Ordinal);
-        _log.ForContext("Drops", counts, destructureObjects: true)
+        // the log store keeps a breakdown it can filter by. The property is a JSON object built
+        // explicitly, so its keys keep the order of the text (the order of the enumeration of a plain
+        // dictionary is not guaranteed).
+        var drops = OrderedProperties.Object(snapshot);
+        _log.ForContext(OrderedProperties.Enricher("Drops", drops))
             .Information("Refused or evicted {Total} in the last {Seconds} s: {Breakdown:l}",
                 snapshot.Values.Sum(), (int)_period.TotalSeconds, breakdown);
     }

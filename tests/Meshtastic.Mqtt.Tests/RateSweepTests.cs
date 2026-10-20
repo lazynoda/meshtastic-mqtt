@@ -133,4 +133,89 @@ public sealed class RateSweepTests
         Assert.True(table.TryTake("bob", "b"));           // "b" was evicted: it starts again with a full budget
         Assert.False(table.TryTake("bob", "a"));          // "a" survived: its budget was already spent
     }
+
+    [Fact]
+    public void TheTokenBucketTable_TouchesOnlyTheEntriesThatWereAlreadyThere()
+    {
+        // A new key is added at the tail of the order, so it is already the most recently used one: it
+        // does not have to be touched. The key that was already there goes to the tail.
+        var clock = new FakeClock();
+        var table = new TokenBucketTable(capacity: 1, refillPerSecond: 0, maxEntries: 1000,
+            idleExpiry: IdleExpiry, time: clock);
+
+        table.TryTake("a");                          // a new key
+        Assert.Equal(0, table.TouchMoves);
+        table.TryTake("b");                          // another new key
+        Assert.Equal(0, table.TouchMoves);
+        table.TryTake("a");                          // "a" was already there: it goes to the tail
+        Assert.Equal(1, table.TouchMoves);
+    }
+
+    [Fact]
+    public void TheClientTable_TakesOverAClientId_AndItIsNotEvictedAtTheCap()
+    {
+        // The client id taken over by another user ends at the tail of the order, so it is the most
+        // recently used one: it is not the client that is evicted when the table is full.
+        //
+        // The taken-over id is the first one that was inserted, so it is the one that would be
+        // evicted if it did not end at the tail of the order.
+        var clock = new FakeClock();
+        var table = new ClientRateTable(capacity: 1, refillPerSecond: 0, maxEntries: 3,
+            idleExpiry: IdleExpiry, time: clock);
+
+        table.TryTake("alice", "x");                  // the first client: the one taken over later
+        table.TryTake("alice", "a");
+        table.TryTake("alice", "b");
+        Assert.Equal(0, table.TouchMoves);           // a new client is added at the tail: it is not touched
+
+        Assert.True(table.TryTake("bob", "x"));      // the id is taken over: a full budget again
+        var moves = table.TouchMoves;                // the take over moved it to the tail of the order
+
+        table.TryTake("bob", "c");                    // a new client: the table is full, so one is evicted
+        Assert.Equal(1, table.Evictions);
+
+        // "x" survived the eviction with the budget it spent on the take over, and "a" is the one
+        // that was evicted: it starts again with a full budget. "x" is checked first: the check of a
+        // client that is not there would evict another one.
+        Assert.False(table.TryTake("bob", "x"));
+        Assert.True(table.TryTake("alice", "a"));
+
+        // The take over is the touch that moved the entry to the tail of the order; the check of "x"
+        // touched it once more, because it was not the last one of the order any more.
+        Assert.Equal(moves + 1, table.TouchMoves);
+    }
+
+    [Fact]
+    public void TheClientTable_TakesOverAClientId_AndItSurvivesTheSweep()
+    {
+        // The client id taken over by another user ends at the tail of the order, so the sweep that
+        // forgets the clients that were idle for a long time forgets the older ones and keeps it.
+        //
+        // The taken-over id is the first one that was inserted, so it is the one that would stop the
+        // sweep if it did not end at the tail of the order.
+        var clock = new FakeClock();
+        var table = new ClientRateTable(capacity: 1, refillPerSecond: 0, maxEntries: 10,
+            idleExpiry: IdleExpiry, time: clock);
+
+        table.TryTake("alice", "x");                  // the first client: the one taken over later
+        table.TryTake("alice", "a");
+        Assert.Equal(0, table.TouchMoves);           // a new client is added at the tail: it is not touched
+
+        clock.Advance(TimeSpan.FromMinutes(50));
+        Assert.True(table.TryTake("bob", "x"));      // the id is taken over: a full budget again
+        var moves = table.TouchMoves;                // the take over moved it to the tail of the order
+
+        clock.Advance(TimeSpan.FromMinutes(20));
+        table.TryTake("bob", "z");                    // a new client: the sweep runs here
+        Assert.Equal(2, table.Count);                // "a" was forgotten, "x" was kept
+
+        // "a" was forgotten by the sweep, so it starts again with a full budget, and "x" was kept
+        // with the budget it spent on the take over.
+        Assert.True(table.TryTake("alice", "a"));
+        Assert.False(table.TryTake("bob", "x"));
+
+        // The take over is the touch that moved the entry to the tail of the order; the check of "x"
+        // touched it once more, because it was not the last one of the order any more.
+        Assert.Equal(moves + 1, table.TouchMoves);
+    }
 }
