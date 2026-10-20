@@ -28,8 +28,8 @@ How a connection travels through the broker, what the broker keeps in memory, an
    publish ACLs are evaluated against, and it never changes hands.
 6. **The hooks.** Every SUBSCRIBE and every PUBLISH goes through the broker's hooks: the subscribe hook
    applies the ACL of the owner, and the publish hook applies the publish ACL, the payload cap, the
-   per-client rate, the packet filter and the packet gate, in that order (see
-   [The order of the checks](packet-filtering.md#the-order-of-the-checks-in-the-publish-hook)).
+   per-client rate, the packet filter, the filters of the rules file and the packet gate, in that order
+   (see [The order of the checks](packet-filtering.md#the-order-of-the-checks-in-the-publish-hook)).
 
 ## What it does with each connection
 
@@ -37,7 +37,7 @@ How a connection travels through the broker, what the broker keeps in memory, an
 |---|---|
 | Connect | Username and password are checked against `users`. Unknown user or wrong password → `BadUserNameOrPassword` (MQTT 3.1.1 return code 4), logged with username and remote IP, never the password. A reconnect with an existing client id takes over the old session, but only for the **same user**: a client id held by a live or persisted session of another user is refused with `ClientIdentifierNotValid` (3.1.1 return code 2) and the session owner stays connected. The id is free again once that session is gone. If the password-check queue is full (see `limits`), the client gets `ServerBusy` (3.1.1 return code 3, "server unavailable") and retries. An address that failed too many logins is banned: the socket is closed at the accept, and a CONNECT that arrives after the ban is refused with `Banned` (0x8A) before the password is checked (see [Auth bans](auth-bans.md)). |
 | Subscribe | The requested filter is granted only if **every** topic it can match is covered by the `subscribe_allow` filters of the user that **created the session** (bound at connect time, so a reused session never changes hands). Real MQTT wildcard semantics, not prefix matching. An empty or missing list denies everything. `#` and `+` never grant `$`-topics such as `$SYS/#`. Refusal → MQTT 5 reason `Not authorized` (135); on MQTT 3.1.1 → `0x80`. |
-| Publish | First the publish ACL (below), then the limits and the packet filter (below). A refused publish is dropped, never forwarded, and the client stays connected. Accepted messages are re-published with `retain` cleared (firmware never retains), so nothing enters the retained-message store. |
+| Publish | First the publish ACL (below), then the limits, the packet filter and the filters of the rules file (below). A refused publish is dropped, never forwarded, and the client stays connected. Accepted messages are re-published with `retain` cleared (firmware never retains), so nothing enters the retained-message store. |
 
 Before any of this, every packet's declared length is checked against `limits.max_packet_size` while its
 fixed header is still being read; a larger one closes the connection before the broker allocates it
@@ -79,6 +79,9 @@ protected:
   own; and the claims of the client ids are locked on the claim dictionary.
 - **The packet filter is pure.** It takes a topic and a payload and returns a verdict: no state, no lock,
   and it never throws (a failure is a drop, not an exception).
+- **The rules of the filters file are immutable.** The broker holds one reference to the set of rules and
+  replaces it in one step when the file changes, so a packet that is judged at that moment sees the old
+  rules or the new ones, never a mix, and the readers never lock.
 - **The crypto is per call.** The AES-CTR of the channel decryption creates its own `Aes` instance
   instead of sharing a static cipher, because two packets that decrypt at the same time, on two
   connections, would corrupt each other with a shared one.
@@ -107,4 +110,5 @@ lost:
 
 - [Security](security.md): the authentication and the ACLs.
 - [Packet filtering](packet-filtering.md): what the publish hook accepts.
+- [Filters](filters.md): the rules of the file that drops the packets of a user, a gateway or a node.
 - [Limits and dedupe](limits-and-dedupe.md): the tables and their caps.

@@ -210,14 +210,22 @@ and never disconnects the client:
 2. **The payload cap**: `payload larger than max_payload_size`.
 3. **The per-client publish rate**: `publish rate exceeded for the client`.
 4. **The packet filter**: everything of this page.
-5. **The cross-gateway dedupe and the per-node packet rate**: `duplicate from the same gateway`,
+5. **The packet filters of the rules file**: the rules of the user, of the gateway and of the node
+   (`filtered: <rule name>`). See [Filters](filters.md).
+6. **The cross-gateway dedupe and the per-node packet rate**: `duplicate from the same gateway`,
    `too many gateways for one packet` and `packet rate exceeded for the node`.
-6. **The retain flag is cleared** and the message is forwarded.
+7. **The retain flag is cleared** and the message is forwarded.
+
+The packet filters of the rules file run **after** the verdict of the decryption (and after the policy
+of `users[].forward_unopened`) and **before** the dedupe and the per-node rate. A copy that a filter
+drops therefore spends no dedupe entry and no budget of the node, and a copy that a filter allows,
+from another gateway, still passes the dedupe and the budget. The map reports and the PKI direct
+messages go through the filters too (see [Filters](filters.md)).
 
 On MQTT 5 a refused publish is answered with reason code `Quota exceeded` (151) for the payload cap, the
 per-client publish rate and the per-node packet rate, with `Not authorized` (135) for the publish ACL, and
-with **no** reason code for the packet filter and the dedupe (those copies are dropped, but the client is
-not told why); MQTT 3.1.1 acknowledgements carry no reason code at all.
+with **no** reason code for the packet filter, the rules file and the dedupe (those copies are dropped,
+but the client is not told why); MQTT 3.1.1 acknowledgements carry no reason code at all.
 
 Inside the packet filter, the checks of a channel packet are in this order:
 
@@ -242,6 +250,7 @@ Inside the packet filter, the checks of a channel packet are in this order:
 
 ## See also
 
+- [Filters](filters.md): the rules of the file that drop the packets of a user, a gateway or a node.
 - [Security](security.md): the ACLs that come before all of this.
 - [Limits and dedupe](limits-and-dedupe.md): the payload cap, the per-client rate and the per-node rate.
 - [Logging](logging.md): every reason string of this page, as the counters show them.

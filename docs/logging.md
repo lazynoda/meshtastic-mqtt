@@ -32,14 +32,17 @@ counts the refusals per reason.
 ## The startup line
 
 One Information line tells the operator what the broker is running with: the address, the port, the
-number of users, the number of channel keys, the `drop_pki` flag and **every limit of the configuration**.
+number of users, the number of channel keys, the `drop_pki` flag, whether the packet filters are on
+(and how many rules they hold) and **every limit of the configuration**.
 
-This is the line that `config.example.yaml` produces (one user, three channel keys and every limit at its
-default; the exempt ranges are empty, so they read as `[]`):
+This is the line that `config.example.yaml` produces (one user, three channel keys, no filters and
+every limit at its default; the exempt ranges are empty, so they read as `[]`):
 
 ```
-Listening on 0.0.0.0:1883 (plain MQTT). 1 user(s), 3 channel key(s), drop_pki=True, limits: max_packet_size=4096, communication_timeout_seconds=10, auth_queue_timeout_seconds=3, auth_max_pending=64, auth_max_pending_per_user=4, max_connections_per_ip=16, connect_rate_per_ip_per_minute=30, connect_burst_per_ip=10, max_payload_size=512, publish_rate_per_client_per_minute=120, publish_burst_per_client=60, dedupe_window_seconds=120, dedupe_max_gateways_per_packet=32, dedupe_max_entries=200000, packet_rate_per_from_per_minute=30, packet_burst_per_from=15, auth_fail_max_per_ip=10, auth_fail_window_seconds=600, auth_ban_seconds=3600, auth_ban_exempt=[], max_tracked_entries=100000, rate_idle_expiry_seconds=600
+Listening on 0.0.0.0:1883 (plain MQTT). 1 user(s), 3 channel key(s), drop_pki=True, filters=off, limits: max_packet_size=4096, communication_timeout_seconds=10, auth_queue_timeout_seconds=3, auth_max_pending=64, auth_max_pending_per_user=4, max_connections_per_ip=16, connect_rate_per_ip_per_minute=30, connect_burst_per_ip=10, max_payload_size=512, publish_rate_per_client_per_minute=120, publish_burst_per_client=60, dedupe_window_seconds=120, dedupe_max_gateways_per_packet=32, dedupe_max_entries=200000, packet_rate_per_from_per_minute=30, packet_burst_per_from=15, auth_fail_max_per_ip=10, auth_fail_window_seconds=600, auth_ban_seconds=3600, auth_ban_exempt=[], max_tracked_entries=100000, rate_idle_expiry_seconds=600
 ```
+
+With a rules file, the line says `filters=on (12 rules)` instead of `filters=off`.
 
 The limits are attached to the line as the structured property `LimitValues`, a JSON object whose keys
 keep the order of the text, so a log store keeps the limits of that run as data and not only as text. The
@@ -83,6 +86,7 @@ These are all of them, as the code writes them:
 | `duplicate from the same gateway` | This gateway already sent this packet. |
 | `too many gateways for one packet` | Too many gateways have already sent this packet. |
 | `packet rate exceeded for the node` | The node used up its packet budget. |
+| `filtered: <rule name>` | A filter refused the packet: the name of the rule is the reason. The name is kept whole (a name may hold digits: `filtered: block-node-1`). See [Filters](filters.md). |
 | `empty payload` | The publish carries no payload. |
 | `unsupported topic (expected <root>/2/e/<channel>/<gateway>)` | The topic is not one of the two shapes the broker accepts. A `/2/json/` topic lands here only when the `publish_allow` of the user covers it; with the ACL of `config.example.yaml` it is counted as `not in publish_allow` instead. |
 | `unsupported map topic (expected <root>/2/map/)` | A map topic that is not exactly `<root>/2/map/`. |
@@ -123,6 +127,11 @@ exception is a number **between two slashes**: it is part of the shape of the re
 the topic format) and not a value, so it is kept. `unsupported topic (expected <root>/2/e/<channel>/<gateway>)`
 and `unsupported map topic (expected <root>/2/map/)` keep their `/2/` in the key.
 
+The reason of a filtered packet is the exception to the rule: it keeps the name of the rule as it is
+written, so `filtered: block-node-1` is counted as `filtered: block-node-1` and not as
+`filtered: block-node-N`. The names come from the rules file, they are unique and there are at most
+10000 of them, so the set of keys stays bounded.
+
 The per-packet `debug` line keeps the real numbers: it says `encrypted payload size 300 outside 1-256`,
 with the numbers the packet really had.
 
@@ -137,15 +146,51 @@ a refusal: it is not counted in the 60 s summary, and it is never a Warning. It 
 packet, like this one:
 
 ```
-Forwarded an unopened packet on "msh/EU_868/2/e/Private/!1a2b3c4d" from "node-1": no key is configured for this channel (channel "Private", from "!1a2b3c4d", id 268435458)
+Forwarded an unopened packet on "msh/EU_868/2/e/Private/!1a2b3c4d" from "node-1": no key is configured for this channel (channel "Private", from "!1a2b3c4d", id 268435458, channel hash matches: False)
 ```
 
-The line names the channel, the `from`, the id of the packet and why it was not opened: no key for the
-channel, or a key that does not open it. It never carries the payload.
+The line names the channel, the `from`, the id of the packet, why it was not opened (no key for the
+channel, or a key that does not open it) and whether the hash of the channel matches the key the broker
+has. It never carries the payload.
 
 When the user drops those packets (`users[].forward_unopened: false`), they are dropped like any other
 refusal: one `debug` line per packet and a count in the 60 s summary under
 `undecryptable with the key configured for this channel`.
+
+## The filtered packets
+
+A packet that a filter of the rules file refuses is a drop like any other:
+
+- it is counted in the 60 s summary under `filtered: <rule name>`, with the name of the rule whole;
+- it is one `debug` line per packet, and nothing above `debug` is written for it:
+
+```
+Dropped publish on "msh/EU_868/2/e/Test/!1a2b3c4d" from "node-1": filtered: only-iberia-and-sfnarrow (scope gateway, key !1a2b3c4d, channel Test, from "!deadbeef", id 536870914, gateway !1a2b3c4d)
+```
+
+The line names the scope of the rule, its key, the name of the rule, the channel, the `from`, the id of
+the packet and the gateway. It **never** carries the payload, the text of the message or the value that
+matched. See [Filters](filters.md).
+
+## The reload of the rules file
+
+When the rules file changes and the new rules are valid, one Information line says so:
+
+```
+Filters reloaded: 12 rules (3 user, 5 gateway, 4 node scopes), sha256 1a2b3c4d
+```
+
+The three numbers are the rules of each kind (they add up to the total) and the hash is the first eight
+hex digits of the SHA-256 of the file.
+
+When the file is not valid, the rules that are in force stay in force and one Warning says what is
+wrong, with the line of every problem:
+
+```
+The filters were not reloaded, the rules that are in force stay in force: /etc/meshtastic-mqtt/filters.yaml:12: users.meshdev[0] (rule 'no-text'): 'channels' has both 'allow' and 'deny' (a constraint is one or the other)
+```
+
+The Warning is written once: it is not repeated until the file changes again.
 
 ## The JSON output
 
@@ -199,3 +244,4 @@ everything that was refused, per reason.
 
 - [Operations](operations.md): how to run the broker and where the logs go.
 - [Limits and dedupe](limits-and-dedupe.md): what each limit bounds.
+- [Filters](filters.md): the rules of the file that drops the packets.

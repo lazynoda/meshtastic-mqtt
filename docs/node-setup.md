@@ -103,7 +103,7 @@ packet, and the broker drops it: a channel packet has to carry an encrypted payl
 
 The channel key is the one of the channel, and the broker knows the keys of the channels of the mesh (see
 [Channel keys](packet-filtering.md#channel-keys)). A packet of a channel whose key the broker does not
-have is forwarded unchanged, as every packet the broker cannot open is (see
+have is forwarded unchanged, as every packet the broker cannot open is (per user, on by default; see
 [The packets the broker cannot open](packet-filtering.md#the-packets-the-broker-cannot-open)).
 
 ## What not to do

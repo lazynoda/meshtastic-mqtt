@@ -28,6 +28,7 @@ remain in the git history: they were always public, they are expired, and they m
 
 - [Channel keys](docs/packet-filtering.md#channel-keys) by the exact channel name, like the firmware.
 - [The packets the broker cannot open are forwarded unchanged](docs/packet-filtering.md#the-packets-the-broker-cannot-open) per user, on by default, and the PKI packets are dropped by default.
+- [Packet filters](docs/filters.md) per user, per gateway and per node, in a file that is reloaded without a restart.
 - [Empty, malformed and plaintext packets are dropped](docs/packet-filtering.md#publish-filtering).
 - [The `/json/` and the malformed topics are dropped](docs/packet-filtering.md#topics-the-broker-drops).
 - [Map reports are validated](docs/packet-filtering.md#map-reports) before they are forwarded.
@@ -57,7 +58,7 @@ remain in the git history: they were always public, they are expired, and they m
   `ServerBusy`, and the client retries.
 - **Subscribe**: the filter is granted only if every topic it can match is covered by the
   `subscribe_allow` of the user that created the session. An empty list denies everything.
-- **Publish**: the publish ACL, then the limits, then the packet filter. A refused publish is dropped,
+- **Publish**: the publish ACL, then the limits, then the packet filter, then the [filters](docs/filters.md) of the rules file. A refused publish is dropped,
   never forwarded, and the client stays connected; a packet the broker cannot open is forwarded unchanged,
   unless the user drops those packets (see [Packet filtering](docs/packet-filtering.md#the-packets-the-broker-cannot-open)).
 
@@ -115,6 +116,7 @@ The startup line says what the broker is running with, and the 60 s summary says
 | [Configuration](docs/configuration.md) | Every key of the config file: its type, its default, its range and when to change it. |
 | [Security](docs/security.md) | The authentication, the subscribe and publish ACLs, the client-id ownership, the packet-size cap and the password hashes. |
 | [Packet filtering](docs/packet-filtering.md) | The topics the broker accepts, the channel keys, the map reports, the gateway binding and the order of the checks. |
+| [Filters](docs/filters.md) | The rules that drop the packets of a user, a gateway or a node, and how the file is reloaded. |
 | [Limits and dedupe](docs/limits-and-dedupe.md) | Every limit, the token buckets, the cross-gateway dedupe, the bounded tables and the residual risks. |
 | [Auth bans](docs/auth-bans.md) | What counts as a failed login, the window, the ban, the exemptions and the residual risks. |
 | [Logging](docs/logging.md) | What is written at each level, the startup line, the 60 s summary and every drop reason. |
