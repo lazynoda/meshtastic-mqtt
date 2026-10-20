@@ -237,8 +237,10 @@ single MQTT byte is read):
   the entry cap alone: every packet keeps a set of the gateways that sent it. The gateways are kept as
   their node numbers (4 bytes each), not as strings, so with the defaults 200000 packets × 32 gateways =
   6.4 million gateway numbers (about 26 MB of raw values). The overhead is on top of that: the set of
-  gateways of one packet, the entry and the tables around it were **measured** on .NET 10, arm64:
-  **~0.86 KB per packet, ~169 MB with the defaults**, not the few MB the entry cap suggests. Lower
+  gateways of one packet, the entry and the tables around it were **measured** in a Debug test host
+  on .NET 10, arm64: **~0.86 KB per packet, ~169 MB with the defaults** (approximate: the order of
+  magnitude is what matters, and the object layout is the same in Release), not the few MB the entry
+  cap suggests. Lower
   `dedupe_max_entries` or `dedupe_max_gateways_per_packet` if the broker runs with a small memory limit.
 - `dedupe_window_seconds: 0` turns the dedupe **off**: the copies of one packet can no longer be told
   apart, so **every copy counts separately against the per-`from` budget** (a packet heard by 5 gateways
@@ -336,7 +338,8 @@ Logs never contain passwords or message payloads. At the default `information` l
 
 - Connections, granted subscriptions and the startup line: Information. The startup line lists every
   limit of the configuration, and the limits are also a structured property of the line (`LimitValues`),
-  so a log store keeps the limits of that run as data and not only as text.
+  so a log store keeps the limits of that run as data and not only as text. The keys of that object
+  keep the order of the line, and the address is written as it is, so the line reads without quotes.
 - Failed logins: Warning, one line per attempt with username and remote IP. The broker counts the
   failures itself and bans the address (see [Auth bans](#auth-bans)): the Warnings are for the operators.
   Refused authentication methods, client-id conflicts and "server busy" refusals are also Warning with
@@ -349,7 +352,8 @@ Logs never contain passwords or message payloads. At the default `information` l
 - Dropped publishes: one Information line every 60 s with the number of refusals and evictions per reason,
   only when something was refused. The line is `Refused or evicted {Total} in the last 60 s: {reason}:
   {count}, ...`: it counts more than dropped publishes, so it does not call them all publishes. The counts
-  per reason are also a structured property of the line (`Drops`), so a log store can filter by them.
+  per reason are also a structured property of the line (`Drops`), so a log store can filter by them, and
+  its keys keep the order of the text of the line.
   Publishes refused by the publish ACL are counted there too (`not in publish_allow`, `invalid topic
   name`), and so are the ones refused by the limits and the dedupe
   (`payload larger than max_payload_size`, `publish rate exceeded for the client`,
