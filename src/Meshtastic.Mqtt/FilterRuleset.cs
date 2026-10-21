@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Text.RegularExpressions;
 using Google.Protobuf;
 using Google.Protobuf.Reflection;
 using Meshtastic.Protobufs;
@@ -256,7 +255,7 @@ internal sealed class FilterCondition
     public int? Portnum;
     public bool NeedsOpening;
     public FieldPath Path = new();
-    public Regex? Pattern;
+    public Re2Pattern? Pattern;
 
     /// <summary>Whether the condition is true for this packet (and then the rule fails).</summary>
     public bool IsTrue(FilterContext context)
@@ -515,7 +514,7 @@ public sealed class FilterRuleset
     public static readonly FilterRuleset Empty = new(
         new Dictionary<string, FilterRule[]>(StringComparer.Ordinal), null,
         new Dictionary<uint, FilterRule[]>(), null,
-        new Dictionary<uint, FilterRule[]>(), null, 0, 0, 0, 0, 0);
+        new Dictionary<uint, FilterRule[]>(), null, 0, 0, 0, 0);
 
     internal readonly Dictionary<string, FilterRule[]> Users;
     internal readonly FilterRule[]? UsersStar;
@@ -528,7 +527,7 @@ public sealed class FilterRuleset
         Dictionary<string, FilterRule[]> users, FilterRule[]? usersStar,
         Dictionary<uint, FilterRule[]> gateways, FilterRule[]? gatewaysStar,
         Dictionary<uint, FilterRule[]> nodes, FilterRule[]? nodesStar,
-        int userRules, int gatewayRules, int nodeRules, int regexPatternCount, long regexBytes)
+        int userRules, int gatewayRules, int nodeRules, int regexPatternCount)
     {
         Users = users;
         UsersStar = usersStar;
@@ -540,7 +539,6 @@ public sealed class FilterRuleset
         GatewayRuleCount = gatewayRules;
         NodeRuleCount = nodeRules;
         RegexPatternCount = regexPatternCount;
-        RegexBytes = regexBytes;
     }
 
     /// <summary>The number of rules of the file.</summary>
@@ -561,12 +559,6 @@ public sealed class FilterRuleset
     /// patterns and not the number of conditions.
     /// </summary>
     internal int RegexPatternCount { get; }
-
-    /// <summary>
-    /// How many bytes the distinct patterns of the file allocated when they were compiled. The cost
-    /// of a pattern depends on its shape, so it is measured and not counted.
-    /// </summary>
-    internal long RegexBytes { get; }
 
     /// <summary>
     /// Judges one packet: it has to pass every rule of every scope that applies to it (its user, the

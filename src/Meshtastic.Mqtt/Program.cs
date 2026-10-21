@@ -74,6 +74,12 @@ static class Cli
                 + string.Join(Environment.NewLine, ex.Errors.Select(error => "- " + error)));
             return 1;
         }
+        catch (Re2UnavailableException ex)
+        {
+            // The rules file needs Google RE2, and its native library is not there.
+            Console.Error.WriteLine($"Cannot start the filters '{config.Filters?.File}': {ex.Message}");
+            return 1;
+        }
 
         using var server = built.Server;
         using var filter = built.Filter;

@@ -657,16 +657,16 @@ public sealed class FilterReloadTests
             var (logger, logs) = FilterFixtures.Logger();
             using var filter = new PacketFilter(config, logger, startWatcher: false);
 
-            // The shape of the review: the file allocates more memory when its patterns are compiled
-            // than the budget of the file, so it does not load.
-            Write(path, FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns,
-                index => $"(?i)buy (cheap|free) [a-z]+ now {index}"));
+            // The shape of the review, one distinct pattern over the budget of the file: it does not
+            // load.
+            Write(path, FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns + 1,
+                index => $"(?i)https?://.{{0,100}}[.](ru|cn|tk)|zq{index}x"));
             filter.CheckForChange();
 
             // The rules that are in force stay in force, and the problem is reported once.
             Assert.Equal(1, filter.RuleCount);
             var warning = Assert.Single(logs.Events, e => e.Level == LogEventLevel.Warning);
-            Assert.Contains("regex memory", warning.RenderMessage());
+            Assert.Contains("regex patterns", warning.RenderMessage());
         }
         finally
         {

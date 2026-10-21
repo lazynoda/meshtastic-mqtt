@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Text.RegularExpressions;
 using Google.Protobuf.Reflection;
 using Meshtastic.Protobufs;
 using YamlDotNet.Core;
@@ -42,13 +41,6 @@ public sealed class FilterException : Exception
     /// load stops at the budget.
     /// </summary>
     internal int CompiledPatterns { get; init; }
-
-    /// <summary>
-    /// How many bytes the distinct patterns of the regular expressions of the file allocated when
-    /// they were compiled. It is the budget of the memory of the patterns of the file, and the tests
-    /// use it to check that the load stops at the budget.
-    /// </summary>
-    internal long RegexBytes { get; init; }
 
     /// <summary>The problems of the file, and the report that lists them.</summary>
     /// <param name="errors">Every problem of the file.</param>
@@ -115,16 +107,17 @@ public static class FilterLoader
 
     /// <summary>
     /// The most distinct patterns of regular expressions a file may hold, counted after the aliases
-    /// are expanded. The memory the patterns allocate is bounded by <see cref="MaxRegexBytes"/>.
+    /// are expanded. Each one holds at most <see cref="RegexMaxMemory"/> bytes of native memory, so
+    /// the patterns of a file hold at most 128 MiB.
     /// </summary>
-    public const int MaxRegexPatterns = 1_000;
+    public const int MaxRegexPatterns = 128;
 
     /// <summary>
-    /// The most bytes the distinct patterns of the regular expressions of a file may allocate when
-    /// they are compiled. The cost of a pattern depends on its shape, so the memory is measured
-    /// while the patterns are compiled and not counted.
+    /// The memory of one compiled pattern (the <c>max_mem</c> of Google RE2): its program and the
+    /// caches RE2 builds while it matches. RE2 flushes a cache that fills its share, so the text of a
+    /// packet cannot make a pattern hold more.
     /// </summary>
-    public const long MaxRegexBytes = 134_217_728;
+    public const long RegexMaxMemory = 1_048_576;
 
     /// <summary>The most bytes a file may have.</summary>
     public const int MaxFileBytes = 1_048_576;
@@ -137,9 +130,6 @@ public static class FilterLoader
 
     /// <summary>The most characters of the name of a rule.</summary>
     public const int MaxNameLength = 64;
-
-    /// <summary>How long a regular expression may run before it is given up.</summary>
-    static readonly TimeSpan RegexTimeout = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
     /// The operators, from the vocabulary of the schema and the enum of the code: a name of
@@ -185,27 +175,14 @@ public static class FilterLoader
     /// <param name="yaml">The text of the file.</param>
     /// <param name="knownUsers">The user names of the config (a rule of an unknown user is an error).</param>
     /// <param name="source">The name of the file, as the messages of the errors write it.</param>
-    public static FilterRuleset Parse(string yaml, IReadOnlyCollection<string> knownUsers, string source = "filters.yaml") =>
-        Parse(yaml, knownUsers, source, MaxRegexBytes);
-
-    /// <summary>
-    /// Compiles the rules of a file that is already in memory, with a budget of the memory of the
-    /// patterns of its own.
-    /// </summary>
-    /// <param name="yaml">The text of the file.</param>
-    /// <param name="knownUsers">The user names of the config (a rule of an unknown user is an error).</param>
-    /// <param name="source">The name of the file, as the messages of the errors write it.</param>
-    /// <param name="maxRegexBytes">The most bytes the patterns of the file may allocate when they
-    /// are compiled.</param>
-    internal static FilterRuleset Parse(string yaml, IReadOnlyCollection<string> knownUsers, string source,
-        long maxRegexBytes)
+    public static FilterRuleset Parse(string yaml, IReadOnlyCollection<string> knownUsers, string source = "filters.yaml")
     {
         // The size of the file is checked before parsing it: a file that is too big is not read.
         var size = System.Text.Encoding.UTF8.GetByteCount(yaml);
         if (size > MaxFileBytes)
             throw new FilterException([$"{source}: {SizeMessage(size)}"]);
 
-        var builder = new RulesetBuilder(knownUsers, source, maxRegexBytes);
+        var builder = new RulesetBuilder(knownUsers, source);
         try
         {
             var stream = new YamlStream();
@@ -229,11 +206,13 @@ public static class FilterLoader
         }
         if (builder.Errors.Count > 0)
         {
+            // The file is not loaded: the patterns it compiled are freed now, not when the GC runs.
+            var compiled = builder.CompiledPatterns;
+            builder.FreePatterns();
             throw new FilterException(builder.Errors)
             {
                 CompiledValues = builder.CompiledValues,
-                CompiledPatterns = builder.CompiledPatterns,
-                RegexBytes = builder.RegexBytes,
+                CompiledPatterns = compiled,
             };
         }
         return builder.Build();
@@ -408,12 +387,11 @@ public static class FilterLoader
     {
         readonly IReadOnlyCollection<string> _knownUsers;
         readonly string _source;
-        readonly long _maxRegexBytes;
         readonly Dictionary<string, List<FilterRule>> _users = new(StringComparer.Ordinal);
         readonly Dictionary<uint, List<FilterRule>> _gateways = [];
         readonly Dictionary<uint, List<FilterRule>> _nodes = [];
         readonly HashSet<string> _names = new(StringComparer.Ordinal);
-        readonly Dictionary<string, Regex> _regexes = new(StringComparer.Ordinal);
+        readonly Dictionary<string, Re2Pattern> _regexes = new(StringComparer.Ordinal);
         List<FilterRule>? _usersStar;
         List<FilterRule>? _gatewaysStar;
         List<FilterRule>? _nodesStar;
@@ -423,13 +401,11 @@ public static class FilterLoader
         int _userRules;
         int _gatewayRules;
         int _nodeRules;
-        long _regexBytes;
 
-        public RulesetBuilder(IReadOnlyCollection<string> knownUsers, string source, long maxRegexBytes)
+        public RulesetBuilder(IReadOnlyCollection<string> knownUsers, string source)
         {
             _knownUsers = knownUsers;
             _source = source;
-            _maxRegexBytes = maxRegexBytes;
         }
 
         /// <summary>Every problem of the file, one per line.</summary>
@@ -441,8 +417,15 @@ public static class FilterLoader
         /// <summary>How many distinct patterns of regular expressions the file has compiled.</summary>
         public int CompiledPatterns => _regexes.Count;
 
-        /// <summary>How many bytes the distinct patterns of the file allocated when they were compiled.</summary>
-        public long RegexBytes => _regexBytes;
+        /// <summary>
+        /// Frees the native objects of the patterns of a file that is not loaded. No ruleset holds
+        /// them, so nothing can be matching them.
+        /// </summary>
+        public void FreePatterns()
+        {
+            foreach (var pattern in _regexes.Values)
+                pattern.Handle.Dispose();
+        }
 
         /// <summary>Records one problem of the file.</summary>
         public void Error(YamlNode? node, string message)
@@ -458,23 +441,6 @@ public static class FilterLoader
         void OverBudget(string what, int limit, int count) =>
             throw new FilterBudgetException(
                 $"{_source}: the file holds more than {limit} {what} (the budget of {what} is {limit}, the file has {count})");
-
-        /// <summary>
-        /// The patterns of the file allocate more memory than the budget allows: the load stops at
-        /// once, with the pattern that crossed the budget.
-        /// </summary>
-        /// <param name="limit">The budget of the memory of the patterns, in bytes.</param>
-        /// <param name="total">The bytes the patterns of the file have allocated.</param>
-        /// <param name="pattern">The pattern that crossed the budget.</param>
-        /// <param name="where">The rule the condition is in.</param>
-        /// <param name="line">The line of the condition, or 0 when it has none.</param>
-        void OverRegexMemory(long limit, long total, string pattern, string where, long line)
-        {
-            var message = $"{where}: the regex patterns of the file allocate more than {limit} bytes when compiled "
-                + $"(the budget of regex memory is {limit} bytes, the file reached {total} bytes "
-                + $"at the pattern '{pattern}')";
-            throw new FilterBudgetException(line > 0 ? $"{_source}:{line}: {message}" : $"{_source}: {message}");
-        }
 
         /// <summary>Counts one condition of the file and refuses it when the budget is over.</summary>
         void CountCondition()
@@ -984,8 +950,8 @@ public static class FilterLoader
                 return null;
             }
 
-            Regex? pattern = null;
-            if (filterOp == FilterOp.Regex && !TryGetRegex(values[0].Text, node, where, out pattern, out var regexError))
+            Re2Pattern? pattern = null;
+            if (filterOp == FilterOp.Regex && !TryGetRegex(values[0].Text, out pattern, out var regexError))
             {
                 Error(node, $"{where}: the condition on '{field}': {regexError}");
                 return null;
@@ -1187,20 +1153,19 @@ public static class FilterLoader
             number >= 0 && number <= FilterSchema.MaxPortNum;
 
         /// <summary>
-        /// The pattern of a regular expression. The same pattern is compiled once and shared by every
-        /// condition that uses it, so a rule that repeats a pattern costs nothing extra, and the file
-        /// may not hold more than <see cref="MaxRegexPatterns"/> distinct patterns nor allocate more
-        /// than <see cref="MaxRegexBytes"/> bytes when they are compiled.
+        /// The pattern of a regular expression, compiled with Google RE2. The same pattern is compiled
+        /// once and shared by every condition that uses it, so a rule that repeats a pattern costs
+        /// nothing extra, and the file may not hold more than <see cref="MaxRegexPatterns"/> distinct
+        /// patterns. Each one holds at most <see cref="RegexMaxMemory"/> bytes, matching included.
         /// </summary>
-        /// <param name="pattern">The pattern of the condition.</param>
-        /// <param name="node">The node of the condition, for the line of the errors.</param>
-        /// <param name="where">The rule the condition is in, for the errors.</param>
+        /// <param name="pattern">The pattern of the condition, in RE2 syntax.</param>
         /// <param name="regex">The compiled pattern, shared with the conditions that use it.</param>
         /// <param name="error">Why the pattern is not used.</param>
-        bool TryGetRegex(string pattern, YamlNode? node, string where, out Regex? regex, out string error)
+        bool TryGetRegex(string pattern, out Re2Pattern? regex, out string error)
         {
             regex = null;
             error = string.Empty;
+            // The options of every pattern are the same, so the pattern alone is the key.
             if (_regexes.TryGetValue(pattern, out var shared))
             {
                 // The pattern is already compiled: the condition shares it, and it costs nothing.
@@ -1216,53 +1181,9 @@ public static class FilterLoader
             // pattern that goes over it.
             if (_regexes.Count >= MaxRegexPatterns)
                 OverBudget("regex patterns", MaxRegexPatterns, _regexes.Count + 1);
-            if (!TryCompileRegex(pattern, out regex, out error, out var allocated))
+            if (!Re2Pattern.TryCompile(pattern, RegexMaxMemory, out regex, out error))
                 return false;
             _regexes[pattern] = regex!;
-
-            // The memory of the file: the cost of a pattern depends on its shape, so it is measured
-            // while the patterns are compiled and not counted.
-            _regexBytes += allocated;
-            if (_regexBytes > _maxRegexBytes)
-                OverRegexMemory(_maxRegexBytes, _regexBytes, pattern, where, node?.Start.Line ?? 0);
-            return true;
-        }
-
-        /// <summary>Compiles the pattern of a regular expression.</summary>
-        /// <param name="pattern">The pattern to compile.</param>
-        /// <param name="regex">The compiled pattern.</param>
-        /// <param name="error">Why the pattern is not valid.</param>
-        /// <param name="allocated">The bytes the compilation allocated on this thread.</param>
-        static bool TryCompileRegex(string pattern, out Regex? regex, out string error, out long allocated)
-        {
-            regex = null;
-            error = string.Empty;
-            allocated = 0;
-            try
-            {
-                // The engine without backtracking: a pattern cannot make the broker hang, and the
-                // constructs it does not support (lookarounds, backreferences) are refused.
-                var before = GC.GetAllocatedBytesForCurrentThread();
-                regex = new Regex(pattern, RegexOptions.NonBacktracking | RegexOptions.CultureInvariant, RegexTimeout);
-                allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-                regex.IsMatch(string.Empty);   // the analysis of the pattern happens here
-            }
-            catch (NotSupportedException ex)
-            {
-                error = "the pattern cannot be used: the engine without backtracking does not support "
-                    + $"the lookarounds and the backreferences ({ex.Message})";
-                return false;
-            }
-            catch (ArgumentException ex)
-            {
-                error = $"the pattern is not a valid regular expression ({ex.Message})";
-                return false;
-            }
-            catch (RegexMatchTimeoutException)
-            {
-                error = "the pattern did not finish in time";
-                return false;
-            }
             return true;
         }
 
@@ -1316,7 +1237,7 @@ public static class FilterLoader
             _gatewaysStar?.ToArray(),
             _nodes.ToDictionary(entry => entry.Key, entry => entry.Value.ToArray()),
             _nodesStar?.ToArray(),
-            _userRules, _gatewayRules, _nodeRules, _regexes.Count, _regexBytes);
+            _userRules, _gatewayRules, _nodeRules, _regexes.Count);
     }
 
     /// <summary>The text of a scalar node ("" when it is not a scalar).</summary>

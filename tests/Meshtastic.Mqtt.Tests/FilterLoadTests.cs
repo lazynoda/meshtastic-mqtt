@@ -13,12 +13,6 @@ public sealed class FilterLoadTests
 {
     static readonly string[] Users = ["meshdev", "alice"];
 
-    /// <summary>
-    /// The pattern of the review: the shape that costs the most memory when it is compiled (a
-    /// case-insensitive alternation and a character class).
-    /// </summary>
-    static readonly Func<int, string> ReviewPattern = index => $"(?i)buy (cheap|free) [a-z]+ now {index}";
-
     /// <summary>Compiles a file that has to fail, and returns the problems it found.</summary>
     static IReadOnlyList<string> Load(string yaml)
     {
@@ -233,7 +227,7 @@ public sealed class FilterLoadTests
     [Fact]
     public void R5_APatternWithABackreferenceIsALoadError()
     {
-        // The engine without backtracking refuses the backreferences, like the lookarounds.
+        // RE2 has no backreferences, like it has no lookarounds.
         var message = Message("""
             users:
               meshdev:
@@ -437,7 +431,7 @@ public sealed class FilterLoadTests
     [Fact]
     public void R5_APatternWithALookaheadIsALoadError()
     {
-        // The engine without backtracking refuses the lookaheads: the file does not load at all.
+        // RE2 has no lookaheads: the file does not load at all.
         var message = Message("""
             users:
               meshdev:
@@ -983,76 +977,39 @@ public sealed class FilterLoadTests
     // ---- X1: the budget of the patterns of the regular expressions --------------------------------------------
 
     [Fact]
-    public void X1_AFileOverTheRegexMemoryBudget_IsALoadErrorAndStopsEarly()
-    {
-        // The shape of the review: the most expensive pattern of the measurements. A thousand of them
-        // allocate more memory than the budget of the file, so the load stops long before the last
-        // one.
-        var yaml = FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns, ReviewPattern);
-        var ex = Assert.Throws<FilterException>(() => FilterLoader.Parse(yaml, Users, "filters.yaml"));
-        Assert.Contains("regex memory", ex.Message);
-        Assert.Contains(FilterLoader.MaxRegexBytes.ToString(CultureInfo.InvariantCulture), ex.Message);
-        // The message names the pattern that crossed the budget.
-        Assert.Contains("(?i)buy (cheap|free) [a-z]+ now ", ex.Message);
-
-        // The load stopped at the budget: it did not compile the thousand patterns of the file.
-        Assert.True(ex.CompiledPatterns < FilterLoader.MaxRegexPatterns,
-            $"the loader compiled {ex.CompiledPatterns} patterns");
-        Assert.True(ex.RegexBytes > FilterLoader.MaxRegexBytes,
-            $"the patterns of the file allocated {ex.RegexBytes} bytes");
-    }
-
-    [Fact]
     public void X1_CheapLiteralsUnderTheBudget_Load()
     {
-        // Two hundred cheap literals: the file loads, and the memory it allocates is under the budget.
-        var ruleset = FilterLoader.Parse(FilterFixtures.FileWithPatterns(200, index => $"spam{index}"),
-            Users, "filters.yaml");
-        Assert.Equal(200, ruleset.RegexPatternCount);
-        Assert.True(ruleset.RegexBytes > 0);
-        Assert.True(ruleset.RegexBytes <= FilterLoader.MaxRegexBytes,
-            $"the patterns of the file allocated {ruleset.RegexBytes} bytes");
+        // As many cheap literals as the budget allows: the file loads.
+        var ruleset = FilterLoader.Parse(FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns,
+            index => $"spam{index}"), Users, "filters.yaml");
+        Assert.Equal(FilterLoader.MaxRegexPatterns, ruleset.RegexPatternCount);
     }
 
     [Fact]
     public void X1_AFileExactlyAtTheBudgetOfThePatterns_Loads()
     {
-        // A thousand distinct patterns: the file loads, and every pattern is compiled once. The budget
-        // of the memory is out of the way, so only the count of the patterns is checked.
+        // As many distinct patterns as the budget allows: the file loads, and every pattern is
+        // compiled once.
         var ruleset = FilterLoader.Parse(FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns),
-            Users, "filters.yaml", long.MaxValue);
+            Users, "filters.yaml");
         Assert.Equal(FilterLoader.MaxRegexPatterns, ruleset.RegexPatternCount);
     }
 
     [Fact]
-    public void X1_ThousandAndOneDistinctPatterns_IsALoadErrorAndStopsCompiling()
+    public void X1_OneDistinctPatternOverTheBudget_IsALoadErrorAndStopsCompiling()
     {
         // One pattern over the budget: the file does not load at all, and the load stops before it
         // compiles the pattern that goes over the budget.
         var yaml = FilterFixtures.FileWithPatterns(FilterLoader.MaxRegexPatterns + 1);
-        var ex = Assert.Throws<FilterException>(() => FilterLoader.Parse(yaml, Users, "filters.yaml", long.MaxValue));
+        var ex = Assert.Throws<FilterException>(() => FilterLoader.Parse(yaml, Users, "filters.yaml"));
         Assert.Contains("budget", ex.Message);
         Assert.Contains("regex patterns", ex.Message);
         Assert.Contains(FilterLoader.MaxRegexPatterns.ToString(CultureInfo.InvariantCulture), ex.Message);
         Assert.Contains((FilterLoader.MaxRegexPatterns + 1).ToString(CultureInfo.InvariantCulture), ex.Message);
 
-        // The load stopped at the budget: it did not compile the thousand and first pattern.
+        // The load stopped at the budget: it did not compile the pattern over it.
         Assert.True(ex.CompiledPatterns <= FilterLoader.MaxRegexPatterns,
             $"the loader compiled {ex.CompiledPatterns} patterns");
-    }
-
-    [Fact]
-    public void X1_ASmallBudgetOfTheMemory_StopsAtTheFirstPattern()
-    {
-        // A budget of one byte: the first pattern goes over it, and the load stops there.
-        var yaml = FilterFixtures.FileWithPatterns(3);
-        var ex = Assert.Throws<FilterException>(() => FilterLoader.Parse(yaml, Users, "filters.yaml", 1));
-        Assert.Contains("regex memory", ex.Message);
-        Assert.Contains("buy[ ]+now-0", ex.Message);
-        Assert.Contains("1 bytes", ex.Message);
-
-        // The load stopped at the first pattern: no other pattern was compiled.
-        Assert.Equal(1, ex.CompiledPatterns);
     }
 
     [Fact]
@@ -1090,10 +1047,6 @@ public sealed class FilterLoadTests
         // One pattern, one compiled regular expression, shared by the four thousand conditions.
         Assert.Equal(1, ruleset.RegexPatternCount);
         Assert.Single(conditions.Select(condition => condition.Pattern).Distinct());
-
-        // The pattern is compiled once, so the memory of the file is the memory of one pattern.
-        Assert.True(ruleset.RegexBytes < 5 * 1024 * 1024,
-            $"the patterns of the file allocated {ruleset.RegexBytes} bytes");
     }
 
     [Fact]

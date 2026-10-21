@@ -109,6 +109,8 @@ public sealed class PacketFilter : IDisposable
     /// <param name="log">Where the reload lines and the warnings are written.</param>
     /// <param name="startWatcher">Whether the background check runs (the tests drive it by hand).</param>
     /// <exception cref="FilterException">The file is missing or is not valid: the broker does not start.</exception>
+    /// <exception cref="Re2UnavailableException">The native library of the regular expressions cannot
+    /// be loaded: the broker does not start.</exception>
     public PacketFilter(BrokerConfig config, ILogger log, bool startWatcher = true)
         : this(config, log, startWatcher, TimeProvider.System, new FilterFile())
     {
@@ -135,6 +137,10 @@ public sealed class PacketFilter : IDisposable
 
         _path = filters.File;
         _period = TimeSpan.FromSeconds(filters.EffectiveReloadCheckSeconds);
+        // The regular expressions of the rules run on Google RE2: a broker whose native library is
+        // missing stops here with a clear message, even when the file has no regex yet (a reload may
+        // add one).
+        Re2.EnsureAvailable();
         _ruleset = LoadRules(_path);
         _loaded = ReadState(_path);
 
