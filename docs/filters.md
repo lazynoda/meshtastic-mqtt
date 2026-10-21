@@ -160,17 +160,46 @@ the packet, or a proto3 field with an explicit presence that is not set.
 
 ### The regular expressions
 
-The pattern is a .NET regular expression, with two limits:
+The pattern is a [Google RE2](https://github.com/google/re2/wiki/Syntax) regular expression:
 
-- the engine runs **without backtracking** (`RegexOptions.NonBacktracking`), so a pattern cannot make the
-  broker hang, and the constructs it does not support (the lookarounds, the backreferences) are a load
-  error;
-- the pattern is at most 512 characters long, and it is given up if it does not finish in time.
+- RE2 runs in time **linear** in the length of the text and never backtracks, so a pattern cannot
+  make the broker hang, whatever the text of the packet;
+- the match is **unanchored** (the pattern may match anywhere in the text: write `^` and `$` to match
+  the whole text) and the text is read as UTF-8, so an accent or an emoji is one character;
+- the pattern is at most 512 characters long, and the memory of one pattern is bounded (see
+  [The memory of the regular expressions](#the-memory-of-the-regular-expressions)).
+
+RE2 does not have every construct of other engines. These are a **load error**, with the message of
+RE2 and the line of the condition:
+
+| Construct | Example | RE2 says |
+|---|---|---|
+| a lookahead or a lookbehind | `(?=hola)`, `(?!x)`, `(?<=a)` | `invalid perl operator: (?=` |
+| a backreference | `(a)\1` | `invalid escape sequence: \1` |
+| a possessive quantifier | `a*+` | `bad repetition operator: *+` |
+| an atomic group | `(?>ab)` | `invalid perl operator: (?>` |
+| `\Z` | `fin\Z` | `invalid escape sequence: \Z` (write `\z`) |
+| a named group written the .NET way | `(?<name>a)` | `invalid perl operator: (?<` (write `(?P<name>a)`) |
+| a .NET-only class | `\p{IsGreek}` | `invalid character class range: \p{IsGreek}` |
+
+Some constructs are accepted but **only see ASCII** in RE2 (in .NET, `\d`, `\w`, `\s` and `\b` also
+matched the other scripts). A pattern written for .NET still loads, and then it may not match the
+text it matched before:
+
+| Construct | In RE2 | To match every script |
+|---|---|---|
+| `\d` | the digits `0-9` | `\p{Nd}` |
+| `\w` | `[0-9A-Za-z_]`: `señal` is not `^\w+$` | `[\p{L}\p{N}_]` |
+| `\s` | `[\t\n\f\r ]` | `[\s\p{Z}]` |
+| `\b` | a boundary between an ASCII word character and another | none: write the separators, e.g. `(^\|[^\p{L}])compra([^\p{L}]\|$)` |
+| `[[:alpha:]]` | `[A-Za-z]` | `\p{L}` |
+
+To ignore the case, start the pattern with `(?i)`: `(?i)compra` matches `COMPRA` and `Compra`, and it
+folds the accented letters too (`(?i)ÁRBOL` matches `árbol`).
 
 The same pattern is **compiled once** and shared by every condition that uses it, so a rule that
 repeats a pattern (and an alias that repeats a rule) costs nothing extra. A file may not hold more
-than 1000 **distinct** patterns, and compiling them may not allocate more than 128 MiB: see
-[The bounds](#the-bounds) and [The memory of the regular expressions](#the-memory-of-the-regular-expressions).
+than 128 **distinct** patterns: see [The bounds](#the-bounds).
 
 ## The paths of the fields
 
@@ -352,8 +381,8 @@ The file may not grow without bound:
 | the rules of the file | 10000 |
 | the conditions of the file | 100000 |
 | the values the file compiles | 1000000 |
-| the distinct patterns of the regular expressions | 1000 |
-| the memory the regex patterns allocate when compiled | 128 MiB (134217728 bytes) |
+| the distinct patterns of the regular expressions | 128 |
+| the memory of one compiled pattern (RE2 `max_mem`) | 1 MiB (1048576 bytes) |
 | the size of the file | 1 MiB (1048576 bytes) |
 | the items of a list | 1000 |
 | the characters of a text value | 512 |
@@ -367,16 +396,21 @@ The bounds are counted **after the aliases of the YAML are expanded**, so an ali
 rules, the conditions or the values of the file does not escape them: a small file that holds a
 million values through its aliases is a load error too. The file is checked while it is compiled and
 the load stops at the first bound it goes over, so a file that is over a bound is not loaded at all.
-The memory of the patterns is measured while they are compiled, and the load stops at the pattern
-that crosses it.
+The distinct patterns are counted before each one is compiled, so the load stops before it compiles
+the 129th.
 
 A file that is bigger is a load error, and the message names the bound, its limit and the count the
 file reached:
 
 ```
 filters.yaml: the file holds more than 1000000 compiled values (the budget of compiled values is 1000000, the file has 1000001)
-filters.yaml: the file holds more than 1000 regex patterns (the budget of regex patterns is 1000, the file has 1001)
-filters.yaml:401: users.meshdev[0] (rule 'r0'): the regex patterns of the file allocate more than 134217728 bytes when compiled (the budget of regex memory is 134217728 bytes, the file reached 135402920 bytes at the pattern '(?i)buy (cheap|free) [a-z]+ now 99')
+filters.yaml: the file holds more than 128 regex patterns (the budget of regex patterns is 128, the file has 129)
+```
+
+A pattern that is too big for the memory of one pattern is a load error too, with the message of RE2:
+
+```
+filters.yaml:5: users.*[0] (rule 'no-spam-links'): the condition on 'payload.text': the pattern is too big for the memory of one pattern (1048576 bytes): pattern too large - compile failed
 ```
 
 The evaluation itself is cheap: when no rule applies to a packet, nothing is read and nothing is
@@ -385,30 +419,41 @@ it.
 
 ### The memory of the regular expressions
 
-The cost of a compiled pattern depends on its **shape**, so it is measured and not counted. What was
-measured on the review VM (.NET 10, arm64, a Debug test host; the numbers are approximate):
+Each distinct pattern is a Google RE2 object with a fixed memory budget of **1 MiB** (RE2's
+`max_mem`, not configurable). The budget holds the compiled program **and** the caches RE2 builds
+while it matches texts: when a cache is full, RE2 throws it away and starts again (and falls back to
+a slower matcher when it has to do that too often). So the text of a packet, which any node with the
+public credentials chooses, cannot make a pattern hold more than its budget: hostile text costs CPU,
+never memory.
 
-| The shape of the pattern | The heap it keeps | The bytes it allocates when compiled |
-|---|---|---|
-| a literal (`spam0`) | 0.12-0.19 MB | 0.19-0.27 MB |
-| a repetition or a class (`buy[ ]+now-0`) | 0.33-0.36 MB | 0.55 MB |
-| a case-insensitive alternation (`(?i)buy (cheap\|free) [a-z]+ now 0`) | 0.78 MB | 1.32 MB |
+A file holds at most **128 distinct patterns**, so the regular expressions of the file hold at most
+**128 MiB** of native memory, the worst case. In practice it is less. Measured on arm64, in a
+container with `--memory 512m`, through the filter of the broker: 128 distinct patterns of the shape
+`(?i)https?://.{0,100}\.(ru|cn|tk)`, each matched against 5000 hostile texts of 200 or 500 characters
+built to fill its cache, grew the process by 52-56 MB, and 128 patterns of the shape `[ab]*a[ab]{18}c`
+against random `a`/`b` texts by 57-66 MB. The growth stopped after the first thousand texts and did
+not climb afterwards. The cost is CPU: on those hostile texts the 128 patterns judged 12-31 packets
+per second, while one realistic pattern on ordinary 240-byte text matched about a million texts per
+second (RE2 alone, measured without the rest of the filter).
 
-So the cost of a pattern is between 0.1 MB and 0.8 MB, and the bytes it allocates when it is
-compiled are about 1.4 to 2 times what it keeps in memory. The file is refused when compiling its
-distinct patterns allocates more than **128 MiB (134217728 bytes)**, or when it holds more than
-**1000 distinct patterns**. The memory budget is the one that is reached first in practice: a few
-hundred cheap literals, or about a hundred patterns of the costliest shape.
+A pattern whose program alone does not fit in 1 MiB is refused when the file is loaded. A counted
+repetition of a large class is the usual cause: `\p{L}{100}` is too big, `\p{L}+` is not.
 
 The identical patterns are compiled **once**: a rule that repeats a pattern (and an alias that
 repeats a rule) costs nothing extra, and the memory of the file is the memory of its distinct
 patterns.
 
+**During a reload** the rules in force keep working while the new file is compiled, so for a moment
+the old patterns and the new ones are both in memory (up to twice the bound). The old ones are freed
+by the garbage collector once nothing references them; the broker tells it how much native memory
+each pattern may hold, so it does not wait for the managed heap to grow. A file that fails to load
+frees the patterns it compiled at once. The C allocator keeps the memory a freed pattern returns for
+the next one, so the resident memory of the process does not drop at once after a reload; measured
+over ten reloads of 128 patterns and back to an empty file, it stayed at the level of one full
+ruleset and did not grow from one reload to the next.
+
 A `contains` condition holds about 0.2 KB, so **use `contains` where a regular expression is not
 needed**: it is the same rule without the memory.
-
-These bounds are the only promise about the memory: the lazy cache that the engine grows while it
-matches a text is not counted by them.
 
 ## Examples
 

@@ -166,9 +166,21 @@ the door, use its `publish_allow`.
 
 ```bash
 docker build --target test .                    # whole suite in the SDK image
-# or, with the SDK installed:
-dotnet test --solution Meshtastic.Mqtt.sln
 ```
+
+The regular expressions of the [packet filters](filters.md#the-regular-expressions) run on Google RE2,
+through a small native library of this repository (`native/re2shim`, `libre2shim.so`). The Docker
+image builds it against the RE2 of its Ubuntu and installs the RE2 runtime library (`libre2-10`) from
+the distribution. To run the tests outside Docker, on Debian or Ubuntu, with the .NET SDK installed:
+
+```bash
+sudo apt-get install g++ libre2-dev
+sh native/re2shim/build.sh "$PWD/native/out"
+LD_LIBRARY_PATH="$PWD/native/out" dotnet test --solution Meshtastic.Mqtt.sln
+```
+
+Without the library, the tests of the regular expressions fail with a message that says it is
+missing and how to build it, and a broker with a `filters:` section does not start.
 
 Test fixtures (`tests/Meshtastic.Mqtt.Tests/Fixtures/*.bin`) are real-format envelopes produced by
 `make_fixtures.py` with hand-written protobuf and OpenSSL AES-CTR, independently of the broker code.

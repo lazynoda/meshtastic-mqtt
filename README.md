@@ -41,6 +41,8 @@ remain in the git history: they were always public, they are expired, and they m
 - [A packet rate per node and a cross-gateway dedupe](docs/limits-and-dedupe.md#per-node-and-the-dedupe).
 - [In-broker bans](docs/auth-bans.md) for the addresses that fail to log in too often, with no fail2ban and no nftables.
 - [Every table is bounded](docs/limits-and-dedupe.md#the-bounded-tables), so the memory cannot grow without bound.
+  The regular expressions of the packet filters run on [Google RE2](docs/filters.md#the-regular-expressions),
+  with a fixed memory budget per pattern.
 
 ### Operations
 
