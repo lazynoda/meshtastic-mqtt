@@ -1,5 +1,10 @@
 # Meshtastic MQTT broker
 
+[![License](https://img.shields.io/github/license/lazynoda/meshtastic-mqtt)](LICENSE)
+[![.NET](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
+[![MQTTnet](https://img.shields.io/badge/MQTTnet-5-blue)](https://github.com/dotnet/MQTTnet)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-lazynoda-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/lazynoda)
+
 An MQTT broker for a Meshtastic mesh, built on [MQTTnet](https://github.com/dotnet/MQTTnet) (C# / .NET 10).
 It is not a generic broker with a few rules on top: it parses every `ServiceEnvelope` it receives,
 decrypts it with the key of its channel, and forwards only what a real node would have sent. The mesh it
