@@ -1,5 +1,6 @@
 # Meshtastic MQTT broker
 
+[![CI](https://github.com/lazynoda/meshtastic-mqtt/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/lazynoda/meshtastic-mqtt/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/lazynoda/meshtastic-mqtt)](LICENSE)
 [![.NET](https://img.shields.io/badge/.NET-10-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
 [![MQTTnet](https://img.shields.io/badge/MQTTnet-5-blue)](https://github.com/dotnet/MQTTnet)
@@ -143,6 +144,18 @@ There is no downlink for the public user either: the broker does support subscri
 user of `config.example.yaml` has no `subscribe_allow`, so a node that uses the public credentials gets
 nothing back.
 
+## Tests
+
+`docker build --target test .` builds the RE2 shim and runs the whole test suite, the same way CI does.
+CI (`.github/workflows/ci.yml`, on every push to `master`) also builds the runtime image, starts it with
+`config.example.yaml`, and checks that the public user can connect and publish, that a wrong password is
+refused and that `hash-password` works.
+
 ## License
 
-GPL-3.0, see [LICENSE](LICENSE).
+AGPL-3.0-only, see [LICENSE](LICENSE). If you run a modified version of this broker for others over a
+network, you must offer them its source code.
+
+This is a fork of [meshtastic/mqtt](https://github.com/meshtastic/mqtt), which is GPL-3.0. The code that comes
+from upstream keeps its GPL-3.0 terms; GPL-3.0 section 13 allows combining it with the AGPL-3.0 code of this
+fork, and the combined work is distributed under the AGPL-3.0.
