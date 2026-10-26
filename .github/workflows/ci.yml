@@ -1,0 +1,75 @@
+name: CI
+
+# Proves that what is on master works. Everything runs through the Dockerfile,
+# the same way it runs on the server: the test stage builds the RE2 shim and
+# runs the whole suite, then the runtime image is built, started with
+# config.example.yaml and checked with a real MQTT client.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and run the test suite (docker build --target test)
+        run: docker build --progress=plain --target test -t meshtastic-mqtt:test .
+
+  image:
+    name: Build and smoke-test the broker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t meshtastic-mqtt:ci .
+
+      - name: Start the broker with the example config
+        run: |
+          docker run -d --name mm-ci -p 127.0.0.1:1883:1883 \
+            -v "$PWD/config.example.yaml:/config/config.yaml:ro" \
+            --read-only --memory 512m \
+            meshtastic-mqtt:ci
+          for i in $(seq 1 30); do
+            (exec 3<>/dev/tcp/127.0.0.1/1883) 2>/dev/null && break
+            sleep 1
+          done
+
+      - name: Public user can connect and publish
+        run: |
+          docker run --rm --network host eclipse-mosquitto:2 \
+            mosquitto_pub -h 127.0.0.1 -p 1883 -i ci-ok \
+              -u meshdev -P large4cats -t msh/EU_868/2/e/LongFast/!00000001 -m ci
+
+      - name: Wrong password is refused
+        run: |
+          if docker run --rm --network host eclipse-mosquitto:2 \
+            mosquitto_pub -h 127.0.0.1 -p 1883 -i ci-bad \
+              -u meshdev -P wrong -t msh/EU_868/2/e/LongFast/!00000001 -m ci; then
+            echo "a wrong password was accepted" >&2
+            exit 1
+          fi
+
+      - name: hash-password works
+        run: printf 'ci-password\nci-password\n' | docker run --rm -i meshtastic-mqtt:ci hash-password | grep -q '^pbkdf2-sha256\$'
+
+      - name: Broker is still running
+        run: test "$(docker inspect -f '{{.State.Running}}' mm-ci)" = true
+
+      - name: Broker log
+        if: always()
+        run: docker logs mm-ci || true
